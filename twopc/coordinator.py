@@ -20,6 +20,18 @@ fenced（代）模式（--fenced 开启，未开启时与旧行为完全兼容�
     收到即自我 fence-out，停止一切写动作，新客户端请求一律 409；
   * 落决定前再核对代账最大值，只有当前代能登记事务或持久决定；
   * 接管沿用原 txid 及内容；旧代的任何响应/错误都不能促成新决定。
+
+整批续采（changefeed）模式（--changefeed 开启，未开启时与旧行为完全兼容）：
+  * changelog 仅记录 COMMITTED 事务：COMMIT 决定落盘的同一 SQLite 写事务内
+    原子分配从 1 连续的 seq，撤销不占号；空写集、同值覆盖批次也原样保留；
+  * 提交在 commit_lock 临界区内“决定+seq → 两库按 seq 顺序应用 → 推进持久
+    发布水位”，水位在双方确认后、成功回执前推进，单调只增；
+  * GET /snapshot 返回与水位前缀严格对应的双库状态（可等待发布完成）；
+    POST /changes {"after":N} 返回 after 之后至当前水位的全部已发布批次，
+    按 seq 排序、无批次为 []；after 须非负整数（禁布尔），超水位 409、
+    非法 400 并定位 after；fenced 下先代号守卫再验 after；
+  * 半批或“双库已应用但水位未落盘”强退，恢复沿用原 seq 幂等补齐并推进
+    水位，不漏批、不重复；fenced 接管保留水位，旧代响应不得推进它。
 """
 
 import argparse
@@ -43,6 +55,7 @@ from common import (  # noqa: E402
     post_json,
     get_json,
     validate_epoch,
+    validate_nonneg_integer,
     validate_transaction,
 )
 
@@ -56,13 +69,26 @@ class FencedOut(Exception):
     """本协调进程已被更新代挤掉：停止一切写动作，不再产生任何决定。"""
 
 
+class BeyondCursor(Exception):
+    """续采 after 超过当前持久发布水位（409），请求不改变任何状态。"""
+
+    def __init__(self, msg, after=None, cursor=None):
+        super().__init__(msg)
+        self.msg = msg
+        self.after = after
+        self.cursor = cursor
+
+
 class Coordinator:
     def __init__(self, dbpath, shard_urls, fenced=False,
-                 crash_after_first_install=False, epoch_file=None):
+                 crash_after_first_install=False, epoch_file=None,
+                 changefeed=False):
         self.dbpath = dbpath
         # shard_urls: {"db1": url, "db2": url}
         self.shard_urls = shard_urls
         self.fenced = fenced
+        # 整批续采（changefeed）模式：发布水位 + 连续 seq 的变更日志
+        self.changefeed = changefeed
         self.crash_after_first_install = crash_after_first_install
         # 本进程代身份文件：每个协调进程必须各自独立（默认按 dbpath 派生）。
         # 多进程共享同一协调库时由调用方经 --epoch-file 显式区分，
@@ -83,9 +109,17 @@ class Coordinator:
         self.inflight_lock = threading.Lock()
         # 提交互斥锁：保证 commit 决定对两库的发布对 /data 呈现为整批
         self.commit_lock = threading.RLock()
+        # 数据库写锁：所有线程共享同一 SQLite 连接，多语句显式事务
+        # （BEGIN IMMEDIATE ... COMMIT）必须串行，否则一个线程的 COMMIT
+        # 会提前提交另一线程仍在进行中的事务，造成决定/序号错乱。
+        self.db_write_lock = threading.RLock()
         # 故障注入开关
         self.crash_after_first_prepare = False
         self.crash_after_first_commit = False
+        # 故障注入：双库均已应用 commit、但发布水位尚未落盘时强退
+        self.crash_after_both_commit = False
+        # 续采发布水位的内存缓存；None 表示尚未读取（或 changefeed 未启用）
+        self._cursor_cache = None
         # fenced 状态
         self.epoch = None           # 本领到的代；非 fenced 恒为 None
         self.fenced_out = False     # 被更新代挤掉后置 True，停止一切写动作
@@ -118,6 +152,20 @@ class Coordinator:
                 "CREATE TABLE IF NOT EXISTS epoch_ledger ("
                 " epoch INTEGER PRIMARY KEY,"
                 " claimed_at TEXT NOT NULL DEFAULT (datetime('now')))"
+            )
+            # 整批续采：仅 COMMITTED 事务进入变更日志。
+            # seq 从 1 连续、只增不复用；ABORT 不占号（无对应行）。
+            self.conn.execute(
+                "CREATE TABLE IF NOT EXISTS changelog ("
+                " seq INTEGER PRIMARY KEY,"
+                " txid TEXT NOT NULL UNIQUE,"
+                " writes BLOB NOT NULL)"
+            )
+            # 整批续采：持久发布水位。仅在两库均确认应用后推进；
+            # 水位 N 表示 seq<=N 的批次均已在两库应用并对外发布。
+            self.conn.execute(
+                "CREATE TABLE IF NOT EXISTS cf_meta ("
+                " key TEXT PRIMARY KEY, val INTEGER NOT NULL)"
             )
 
     # ---------------------------------------------------------- 代管理
@@ -164,20 +212,21 @@ class Coordinator:
         i = 0
         while True:
             try:
-                self.conn.execute("BEGIN IMMEDIATE")
-                try:
-                    mx = self.conn.execute(
-                        "SELECT COALESCE(MAX(epoch),0) FROM epoch_ledger"
-                    ).fetchone()[0]
-                    epoch = mx + 1
-                    self.conn.execute(
-                        "INSERT INTO epoch_ledger(epoch) VALUES(?)", (epoch,)
-                    )
-                    self.conn.execute("COMMIT")
-                except Exception:
-                    with contextlib.suppress(sqlite3.Error):
-                        self.conn.execute("ROLLBACK")
-                    raise
+                with self.db_write_lock:
+                    self.conn.execute("BEGIN IMMEDIATE")
+                    try:
+                        mx = self.conn.execute(
+                            "SELECT COALESCE(MAX(epoch),0) FROM epoch_ledger"
+                        ).fetchone()[0]
+                        epoch = mx + 1
+                        self.conn.execute(
+                            "INSERT INTO epoch_ledger(epoch) VALUES(?)", (epoch,)
+                        )
+                        self.conn.execute("COMMIT")
+                    except Exception:
+                        with contextlib.suppress(sqlite3.Error):
+                            self.conn.execute("ROLLBACK")
+                        raise
                 return epoch
             except sqlite3.OperationalError as e:
                 # locked/busy：另一进程正在领号，退避后重试，绝不复用
@@ -216,6 +265,208 @@ class Coordinator:
         if self.ledger_max_epoch() != self.epoch:
             self._mark_fenced_out("代账最大值已不是本代")
             raise FencedOut("代 %s 不再是当前代" % self.epoch)
+
+    # ---------------------------------------------------------- 整批续采
+    def publish_cursor(self):
+        """持久发布水位（未启用 changefeed 或空态为 0）。
+
+        水位 N 表示 seq<=N 的提交批次都已在两库应用并完成发布；
+        seq 大于水位的变更日志行可能已分配序号但尚未发布（半批/在途）。
+        """
+        if not self.changefeed:
+            return 0
+        if self._cursor_cache is not None:
+            return self._cursor_cache
+        row = self.conn.execute(
+            "SELECT val FROM cf_meta WHERE key='publish_cursor'"
+        ).fetchone()
+        value = row[0] if row else 0
+        self._cursor_cache = value
+        return value
+
+    def _max_changelog_seq(self):
+        row = self.conn.execute(
+            "SELECT COALESCE(MAX(seq),0) FROM changelog"
+        ).fetchone()
+        return row[0]
+
+    def _persist_commit_decision(self, txid, blob):
+        """落 COMMIT 决定并在同一事务内原子分配连续 seq。
+
+        在 BEGIN IMMEDIATE 写事务内完成 txn 决定更新与 changelog 插入：
+        seq = max(seq)+1 从 1 连续，只增不复用；撤销事务不写 changelog、
+        不占号。并发提交由 SQLite 文件锁串行化，绝不重号/跳号。
+        """
+        i = 0
+        while True:
+            try:
+                with self.db_write_lock:
+                    self.conn.execute("BEGIN IMMEDIATE")
+                    try:
+                        cur = self.conn.execute(
+                            "UPDATE txn SET state=?, decided_at=datetime('now') "
+                            "WHERE txid=? AND state=?",
+                            (COMMITTED, txid, PENDING),
+                        )
+                        if cur.rowcount == 0:
+                            # 已有决定（可能由接管方落盘）：绝不覆盖
+                            self.conn.execute("ROLLBACK")
+                            row = self.conn.execute(
+                                "SELECT state FROM txn WHERE txid=?", (txid,)
+                            ).fetchone()
+                            raise Conflict(
+                                "txid %s: 决定已存在为 %s，不得改为 %s"
+                                % (txid, row[0] if row else "?", COMMITTED)
+                            )
+                        seq = self._max_changelog_seq() + 1
+                        self.conn.execute(
+                            "INSERT INTO changelog(seq,txid,writes) VALUES(?,?,?)",
+                            (seq, txid, blob),
+                        )
+                        self.conn.execute("COMMIT")
+                    except Conflict:
+                        raise
+                    except Exception:
+                        with contextlib.suppress(sqlite3.Error):
+                            self.conn.execute("ROLLBACK")
+                        raise
+                return seq
+            except sqlite3.OperationalError as e:
+                msg = str(e).lower()
+                if "locked" in msg or "busy" in msg:
+                    time.sleep(RETRY_DELAYS[min(i, len(RETRY_DELAYS) - 1)])
+                    i += 1
+                    continue
+                raise
+
+    def _advance_cursor_to(self, seq):
+        """发布水位推进到 seq（单调）：仅在两库确认应用后调用。
+
+        同一 SQLite 事务内读改写，天然只增不减；推进成功后更新内存缓存。
+        """
+        i = 0
+        while True:
+            try:
+                with self.db_write_lock:
+                    self.conn.execute("BEGIN IMMEDIATE")
+                    try:
+                        row = self.conn.execute(
+                            "SELECT val FROM cf_meta WHERE key='publish_cursor'"
+                        ).fetchone()
+                        current = row[0] if row else 0
+                        if seq > current:
+                            current = seq
+                            self.conn.execute(
+                                "INSERT INTO cf_meta(key,val) "
+                                "VALUES('publish_cursor',?) "
+                                "ON CONFLICT(key) DO UPDATE SET val=excluded.val",
+                                (current,),
+                            )
+                        self.conn.execute("COMMIT")
+                    except Exception:
+                        with contextlib.suppress(sqlite3.Error):
+                            self.conn.execute("ROLLBACK")
+                        raise
+                self._cursor_cache = current
+                return current
+            except sqlite3.OperationalError as e:
+                msg = str(e).lower()
+                if "locked" in msg or "busy" in msg:
+                    time.sleep(RETRY_DELAYS[min(i, len(RETRY_DELAYS) - 1)])
+                    i += 1
+                    continue
+                raise
+
+    def snapshot(self, epoch=None):
+        """GET /snapshot：返回与发布水位前缀严格对应的双库状态。
+
+        先等待在途事务结束（发布未完成则等待），再在提交互斥锁内读两库，
+        保证快照恰好对应 cursor 前缀：不含任何 seq>cursor 的半批/在途写入。
+        """
+        self._ensure_active()
+        with self.inflight_lock:
+            waiters = list(self.inflight.values())
+        for t in waiters:
+            t.join()
+        self._ensure_active()
+        with self.commit_lock:
+            data = self._read_both_shards(epoch)
+            return {"cursor": self.publish_cursor(), "data": data}
+
+    def changes(self, after, epoch=None):
+        """POST /changes：返回 after 之后至当前水位的全部批次（按 seq 排序）。
+
+        只返回已发布（seq<=发布水位）的批次；无批次为 []。after 必须是非负
+        整数；超过当前水位返回 409（由 HTTP 层映射 BeyondCursor）。
+        """
+        self._ensure_active()
+        validate_nonneg_integer(after)
+        with self.commit_lock:  # 与发布互斥，读取的是同一发布视图
+            cursor = self.publish_cursor()
+            if after > cursor:
+                raise BeyondCursor(
+                    "after=%d 超过当前发布水位 %d" % (after, cursor),
+                    after=after, cursor=cursor,
+                )
+            rows = self.conn.execute(
+                "SELECT seq, txid, writes FROM changelog "
+                "WHERE seq>? AND seq<=? ORDER BY seq",
+                (after, cursor),
+            ).fetchall()
+            batches = [
+                {"seq": seq, "txid": txid,
+                 "writes": json.loads(blob.decode("utf-8"))}
+                for seq, txid, blob in rows
+            ]
+            return {"cursor": cursor, "batches": batches}
+
+    def _read_both_shards(self, epoch=None):
+        """在调用方持有的 commit_lock 内顺序读取两库已提交数据。"""
+        out = {}
+        for shard in SHARDS:
+            code, data = get_json(
+                self.shard_urls[shard], "/data", epoch=epoch
+            )
+            if code == 409 and isinstance(data, dict) \
+                    and data.get("reason") == "stale_epoch":
+                self._mark_fenced_out(
+                    "快照/查询被分库 %s 判 stale" % shard
+                )
+                raise FencedOut("读两库时代不符")
+            if code != 200 or not isinstance(data, dict):
+                raise RuntimeError("分库 %s 数据查询失败: %r" % (shard, data))
+            out[shard] = data["data"]
+        return out
+
+    # ---------------------------------------------------------- 提交发布
+    def _publish_committed(self, txid, seq, blob):
+        """在提交互斥锁内完成整批发布：两库按 seq 顺序应用，再推进水位。
+
+        两库确认 commit 之后、向上层返回成功之前持久推进发布水位；
+        分库侧 commit 幂等，任何阶段强退都由恢复沿用同一 seq 补齐，
+        不漏批、不重复应用。返回发布后的水位。
+        """
+        norm = json.loads(blob.decode("utf-8"))
+        with self.commit_lock:
+            for shard in SHARDS:
+                self._decision_call(txid, shard, "/commit")
+                # 故障注入点：commit 已落盘、仅一库应用后强退（半批现场）
+                if self.crash_after_first_commit:
+                    self.crash_after_first_commit = False
+                    sys.stderr.write(
+                        "[fault] crash after commit applied on first shard "
+                        "(txid=%s, seq=%s)\n" % (txid, seq)
+                    )
+                    os._exit(78)
+            # 故障注入点：两库均应用、发布水位落盘前强退（水位落后现场）
+            if self.crash_after_both_commit:
+                self.crash_after_both_commit = False
+                sys.stderr.write(
+                    "[fault] crash after both shards committed but before "
+                    "cursor durable (txid=%s, seq=%s)\n" % (txid, seq)
+                )
+                os._exit(80)
+            return self._advance_cursor_to(seq)
 
     def install_on_shards(self):
         """先向两个分库安装本代；同代幂等、低代由分库拒绝。
@@ -289,7 +540,7 @@ class Coordinator:
                 # 只有当前代能登记新事务
                 self._check_leadership()
                 # 先持久登记事务，再进行任何通信
-                with self.conn:
+                with self.db_write_lock, self.conn:
                     self.conn.execute(
                         "INSERT INTO txn(txid,writes,state) VALUES(?,?,?)",
                         (txid, blob, PENDING),
@@ -327,12 +578,21 @@ class Coordinator:
                 decision = COMMITTED
             else:
                 decision = ABORTED
-            self._persist_decision(txid, decision)
 
-            if decision == COMMITTED:
-                self._commit_both(txid)
-            else:
+            if decision == ABORTED:
+                # 撤销不占号：仅落 ABORT 决定，不写变更日志
+                self._persist_decision(txid, ABORTED)
                 self._abort_both(txid)
+            elif self.changefeed:
+                # 整批续采：在发布互斥段内原子落 COMMIT 决定+连续 seq，
+                # 两库按 seq 顺序应用，双方确认后才推进持久发布水位
+                self._check_leadership()
+                blob = canonical_writes(norm)
+                seq = self._persist_commit_decision(txid, blob)
+                self._publish_committed(txid, seq, blob)
+            else:
+                self._persist_decision(txid, COMMITTED)
+                self._commit_both(txid)
         except FencedOut:
             # 本代已失效：停下，不登记任何新决定（旧代错误不促成新决定）
             sys.stderr.write("[fence] worker(txid=%s) 因代失效中止\n" % txid)
@@ -378,7 +638,7 @@ class Coordinator:
     def _persist_decision(self, txid, decision):
         # 只有当前代能持久决定：再核对一次共享代账
         self._check_leadership()
-        with self.conn:
+        with self.db_write_lock, self.conn:
             cur = self.conn.execute(
                 "UPDATE txn SET state=?, decided_at=datetime('now') "
                 "WHERE txid=? AND state=?",
@@ -446,7 +706,12 @@ class Coordinator:
         """启动时同步恢复：无决定事务撤销；已有 commit 继续完成。
 
         fenced 模式下必须在两库安装本代之后调用；恢复全部完成才对外服务。
+        changefeed 模式下 COMMITTED 批次必须严格按 seq 顺序补齐发布并推进
+        水位，因此采用单线程顺序恢复（服务尚未开放，无并发提交）。
         """
+        if self.changefeed:
+            self._recover_changefeed()
+            return
         rows = self.conn.execute("SELECT txid, writes, state FROM txn").fetchall()
         for txid, blob, state in rows:
             if isinstance(blob, str):  # 兼容被外部以 TEXT 写入的记录
@@ -462,6 +727,38 @@ class Coordinator:
         # 全部恢复完成后才对外服务，保证 /data 不读到恢复中间态
         for t in list(self.inflight.values()):
             t.join()
+
+    def _recover_changefeed(self):
+        """整批续采恢复：沿用原序号补齐，不漏批、不重复。
+
+        1) 变更日志中的 COMMITTED 批次按 seq 升序：向两库幂等补发 commit
+           （已应用的分库不重复应用），再把发布水位推进到该 seq；
+           半批或“双库已应用但水位未落盘”现场都由此收敛；
+        2) 无决定（PENDING）事务补 ABORT 并通知撤销（本就不占号）；
+        3) ABORTED 事务补发 abort。
+        """
+        # 先读持久水位，缓存失效重建
+        self._cursor_cache = None
+        rows = self.conn.execute(
+            "SELECT c.seq, c.txid, c.writes FROM changelog c "
+            "JOIN txn t ON t.txid=c.txid "
+            "WHERE t.state=? ORDER BY c.seq", (COMMITTED,)
+        ).fetchall()
+        for seq, txid, blob in rows:
+            if isinstance(blob, str):
+                blob = blob.encode("utf-8")
+            # 沿用原 seq 发布；分库幂等，水位只增，强退任意阶段都安全
+            self._publish_committed(txid, seq, blob)
+
+        others = self.conn.execute(
+            "SELECT txid, writes, state FROM txn "
+            "WHERE state IN (?, ?)", (PENDING, ABORTED)
+        ).fetchall()
+        for txid, blob, state in others:
+            if isinstance(blob, str):
+                blob = blob.encode("utf-8")
+            norm = json.loads(blob.decode("utf-8"))
+            self._recover_one(txid, norm, state)
 
     def _recover_one(self, txid, norm, state):
         try:
@@ -509,21 +806,7 @@ class Coordinator:
             t.join()
         self._ensure_active()
         with self.commit_lock:
-            out = {}
-            for shard in SHARDS:
-                code, data = get_json(
-                    self.shard_urls[shard], "/data", epoch=epoch
-                )
-                if code == 409 and isinstance(data, dict) \
-                        and data.get("reason") == "stale_epoch":
-                    self._mark_fenced_out(
-                        "查询被分库 %s 判 stale" % shard
-                    )
-                    raise FencedOut("一致查询时代不符")
-                if code != 200 or not isinstance(data, dict):
-                    raise RuntimeError("分库 %s 数据查询失败: %r" % (shard, data))
-                out[shard] = data["data"]
-            return out
+            return self._read_both_shards(epoch=epoch)
 
 
 def make_handler(coord):
@@ -603,6 +886,8 @@ def make_handler(coord):
                         "coordinator": True, "ok": True,
                         "fenced": coord.fenced, "epoch": coord.epoch,
                         "fenced_out": coord.fenced_out,
+                        "changefeed": coord.changefeed,
+                        "cursor": coord.publish_cursor(),
                     })
                 elif path == "/debug/epoch":
                     # 观测接口不设代号守卫，便于测试确认代际状态
@@ -615,6 +900,14 @@ def make_handler(coord):
                     epoch = self._query_epoch()
                     self._guard_epoch(epoch)
                     self._send(200, {"data": coord.consistent_data(epoch=epoch)})
+                elif path == "/snapshot":
+                    if not coord.changefeed:
+                        self._send(404, {"error": "未启用 --changefeed，接口不可用"})
+                        return
+                    # 先沿用代号守卫，再进入快照视图
+                    epoch = self._query_epoch()
+                    self._guard_epoch(epoch)
+                    self._send(200, coord.snapshot(epoch=epoch))
                 elif path.startswith("/txn/") and path.endswith("/status"):
                     epoch = self._query_epoch()
                     self._guard_epoch(epoch)
@@ -653,6 +946,17 @@ def make_handler(coord):
                         "state": state,
                         "result": "committed" if state == COMMITTED else "aborted",
                     })
+                elif path == "/changes":
+                    if not coord.changefeed:
+                        self._send(404, {"error": "未启用 --changefeed，接口不可用"})
+                        return
+                    # 先沿用代号守卫，再验 after
+                    epoch = self._request_epoch(obj)
+                    self._guard_epoch(epoch)
+                    if not isinstance(obj, dict) or "after" not in obj:
+                        raise BadRequest("after: 字段缺失")
+                    after = validate_nonneg_integer(obj["after"])
+                    self._send(200, coord.changes(after, epoch=epoch))
                 elif path == "/control/crash-after-first-prepare":
                     self._guard_epoch(self._request_epoch(obj))
                     coord.crash_after_first_prepare = True
@@ -661,6 +965,10 @@ def make_handler(coord):
                     self._guard_epoch(self._request_epoch(obj))
                     coord.crash_after_first_commit = True
                     self._send(200, {"ok": True, "arm": "crash_after_first_commit"})
+                elif path == "/control/crash-after-both-commit":
+                    self._guard_epoch(self._request_epoch(obj))
+                    coord.crash_after_both_commit = True
+                    self._send(200, {"ok": True, "arm": "crash_after_both_commit"})
                 else:
                     self._send(404, {"error": "未知路径", "path": self.path})
             except BadRequest as e:
@@ -676,6 +984,10 @@ def make_handler(coord):
                                  "fenced_out": True})
             except Conflict as e:
                 self._send(409, {"error": e.msg})
+            except BeyondCursor as e:
+                # after 超过发布水位：409 且定位 after，不改任何状态
+                self._send(409, {"error": e.msg, "reason": "after_beyond_cursor",
+                                 "after": e.after, "cursor": e.cursor})
             except Exception as e:
                 self._send(500, {"error": str(e)})
 
@@ -691,6 +1003,9 @@ def main():
     ap.add_argument("--db2-url", required=True)
     ap.add_argument("--fenced", action="store_true",
                     help="启用 fenced 代模式：领号、安装分库、代校验")
+    ap.add_argument("--changefeed", action="store_true",
+                    help="启用整批续采：连续 seq 变更日志、发布水位、"
+                         "GET /snapshot 与 POST /changes")
     ap.add_argument("--epoch-file", default=None,
                     help="本进程代身份文件；多个协调进程共享协调库时必须各自不同")
     ap.add_argument("--crash-after-first-install", action="store_true",
@@ -706,6 +1021,7 @@ def main():
         fenced=args.fenced,
         crash_after_first_install=args.crash_after_first_install,
         epoch_file=args.epoch_file,
+        changefeed=args.changefeed,
     )
 
     if args.fenced:
@@ -723,8 +1039,9 @@ def main():
     print("coordinator recovery done", flush=True)
 
     httpd = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(coord))
-    print("coordinator listening on %d, db=%s, fenced=%s, epoch=%s"
-          % (args.port, args.db, args.fenced, coord.epoch), flush=True)
+    print("coordinator listening on %d, db=%s, fenced=%s, epoch=%s, changefeed=%s"
+          % (args.port, args.db, args.fenced, coord.epoch, coord.changefeed),
+          flush=True)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

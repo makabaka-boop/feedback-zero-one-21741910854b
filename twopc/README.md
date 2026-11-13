@@ -8,12 +8,13 @@
 
 | 文件 | 作用 |
 |---|---|
-| `common.py` | 输入校验（txid/key 标识规则、写集规范化、epoch 正整数校验）、HTTP 客户端工具（可携带 epoch） |
+| `common.py` | 输入校验（txid/key 标识规则、写集规范化、epoch 正整数与 after 非负整数校验）、HTTP 客户端工具（可携带 epoch） |
 | `shard.py` | 分库（参与者）进程：prepare/commit/abort、键锁、持久终态、故障注入、代安装与代号守卫 |
-| `coordinator.py` | 协调者进程：事务登记、2PC 驱动、持久决定、重启恢复、一致查询、fenced 代（epoch）领号与接管 |
+| `coordinator.py` | 协调者进程：事务登记、2PC 驱动、持久决定、重启恢复、一致查询、fenced 代（epoch）领号与接管、整批续采（changefeed）变更日志与发布水位 |
 | `acceptance_test.py` | 三进程端到端验收（含两类强退与三类通信故障） |
 | `fence_acceptance_test.py` | fenced 代模式验收：双协调进程滚动接管、强退、迟到代消息、线性一致（99 项断言） |
-| `run_demo.sh` | 手动启动三进程演示（`./run_demo.sh` 普通模式 / `./run_demo.sh fenced` 代模式） |
+| `changefeed_acceptance_test.py` | 整批续采验收：连续 seq、撤销不占号、快照/续取、after 校验、交错、丢应答、两类强退恢复、fenced 接管水位保留、未启用兼容（112 项断言） |
+| `run_demo.sh` | 手动启动三进程演示（`normal` / `fenced` / `feed` / `fenced-feed`） |
 
 运行要求：Python 3.8+，无第三方依赖。所有命令建议用 `python3 -I` 运行。
 
@@ -21,12 +22,15 @@
 
 ```bash
 # 一键验收（自动拉起/强退/重启三个进程，结束自动清理）
-python3 -I acceptance_test.py        # 普通模式，88 项断言
-python3 -I fence_acceptance_test.py  # fenced 代模式，99 项断言
+python3 -I acceptance_test.py           # 普通模式，88 项断言
+python3 -I fence_acceptance_test.py     # fenced 代模式，99 项断言
+python3 -I changefeed_acceptance_test.py  # 整批续采模式，112 项断言
 
 # 手动演示
-./run_demo.sh            # 普通模式
-./run_demo.sh fenced     # fenced 代模式
+./run_demo.sh             # 普通模式
+./run_demo.sh fenced      # fenced 代模式
+./run_demo.sh feed        # 整批续采模式
+./run_demo.sh fenced-feed # 代 + 整批续采同时启用
 ```
 
 ## 事务 JSON 格式
@@ -56,9 +60,12 @@ python3 -I fence_acceptance_test.py  # fenced 代模式，99 项断言
 | `POST /submit` | 提交事务；同步返回 `{"state":"COMMITTED|ABORTED"}`，仅双方确认 commit 后才 committed |
 | `GET /txn/{txid}/status` | 协调者侧事务状态 `PENDING/COMMITTED/ABORTED` |
 | `GET /data` | **双库一致查询**：等待在途事务结束，并在提交互斥锁内读取两库，按 key 字节序返回 |
+| `GET /snapshot` | 仅 `--changefeed`：返回 `{"cursor":发布水位,"data":{db1,db2}}`，快照恰对应 cursor 前缀；可等待发布完成 |
+| `POST /changes` | 仅 `--changefeed`：入参 `{"after":N}`，返回 `{"cursor":水位,"batches":[...]}`，取 after 之后至当前水位的全部批次（按 seq 排序，无批次为 `[]`） |
 | `GET /debug/epoch` | 观测：`fenced`、本进程 `epoch`、代账最大值 `ledger_max`、是否 `fenced_out`（无代号守卫） |
 | `POST /control/crash-after-first-prepare` | 故障注入：下一个事务在单库 prepare 后 `SIGKILL` 式强退 |
-| `POST /control/crash-after-first-commit` | 故障注入：下一个事务 commit 落盘且仅一库应用后强退 |
+| `POST /control/crash-after-first-commit` | 故障注入：下一个事务 commit 落盘且仅一库应用后强退（半批现场） |
+| `POST /control/crash-after-both-commit` | 故障注入（changefeed）：下一个事务两库均应用、发布水位落盘前强退（水位落后现场） |
 
 ### 分库（默认 19011/19012）
 
@@ -168,6 +175,88 @@ commit 补发给 db2，最终**两库 k 均为 "a"**，db1 不重复应用；此
 | F8 | **线性一致**：接管窗口错代查询 409 绝无半批；代账 1..N 连续不复用；终态不可反转 |
 
 共 99 项断言，可重复运行（每轮清空 `run_fence/` 重建进程与库）。
+
+## 整批续采（changefeed）模式
+
+把分析副本从“整库快照一次性拷贝”切换为“快照 + 增量批次续采”。给**全新集群**
+的协调进程加 `--changefeed`（分库无需任何改动；可与 `--fenced` 叠加）。未启用时
+协议字节与行为完全不变，`/snapshot`、`/changes` 返回 404，协调库不写任何续采记录。
+
+### 序号与发布水位
+
+协调库新增两张表：
+
+* `changelog(seq, txid, writes)`：**仅 COMMITTED 事务**入表。COMMIT 决定落盘的
+  同一个 SQLite 写事务（`BEGIN IMMEDIATE`）内原子分配 `seq = max(seq)+1`，
+  **从 1 连续、只增不复用**；**撤销（ABORT）不写表、不占号**。空写集事务、同值
+  覆盖事务同样各占一个 seq，批次里保留原始 `writes`（空对象与 `null` 值都不省略）。
+* `cf_meta('publish_cursor')`：持久**发布水位** N，含义是 `seq <= N` 的批次都已在
+  两库应用并完成发布。**双方确认 commit 之后、向上层返回成功回执之前**才推进水位，
+  水位单调只增。
+
+多工作线程共享一个 SQLite 连接，所有多语句写事务由进程内 `db_write_lock` 串行化，
+杜绝一个线程的 `COMMIT` 提前提交另一线程在途事务；并发提交因此严格连续不重号。
+
+### 发布顺序与交错准备
+
+prepare 阶段仍允许交错（不同事务可同时在两库准备、抢键仍立即反对）。一旦走到
+提交，协调者在 `commit_lock` 临界区内完成“落 COMMIT 决定 + 分配 seq → 两库顺序
+应用 → 推进水位”，因此**两库都严格按 seq 顺序应用**，对快照/续采呈现整批，绝不
+暴露半批。分库 commit 幂等，重试不重复应用、也不新增序号。
+
+### 两个接口
+
+* `GET /snapshot` → `{"cursor":N,"data":{"db1":{...},"db2":{...}}}`。先等待在途
+  事务结束（发布未完成则等待），再在提交互斥锁内读两库，**快照恰好对应 cursor
+  前缀**：不含任何 `seq > cursor` 的半批/在途写入。
+* `POST /changes`，入参 `{"after":N}` → `{"cursor":N,"batches":[{"seq","txid",
+  "writes"},...]}`。在同一发布视图内返回 `after` 之后至当前水位的**全部**批次，
+  按 seq 升序；没有批次时为 `[]`。批次含 `seq`、`txid` 与原始 `writes`，空写集与
+  同值覆盖也原样保留。
+
+**校验顺序：先沿用代号守卫（fenced 下），再验 `after`。** `after` 必须是非负整数
+（0 合法，表示从头取全部），明确禁止布尔（`true/false` 是 int 子类）、浮点、字符串、
+`null` 与负数；非法返回 `400` 且错误定位到 `after`。`after` 超过当前发布水位返回
+`409 {"reason":"after_beyond_cursor","after":...,"cursor":...}`，不改任何状态。
+
+### 故障与恢复
+
+强退可能落在两处，恢复都“沿用原序号补齐，不漏批、不重复”：
+
+1. **半批**：commit 决定与 seq 已落盘、仅一库应用后强退。重启恢复按 changelog 的
+   seq 升序，向两库幂等补发 commit（已应用的库不重复应用），再把水位推进到该 seq。
+2. **水位落后**：两库都已应用、但水位尚未落盘时强退。重启后同样补发（分库幂等
+   直接确认）并补推进水位，应用次数不增加。
+
+恢复在开放 HTTP 前单线程按 seq 顺序完成，因此服务一旦可用，快照与续采即自洽。
+重试通知不增号；`/changes` 只返回 `seq <= 水位` 的已发布批次，未发布的在途批次
+不可见。
+
+### 与 fenced 叠加（接管）
+
+接管协调进程共享同一协调库，因此**接管保留发布水位与全部 changelog**，新代提交的
+seq 跨代严格接续。`/snapshot`、`/changes` 在 fenced 下同样必须带当前代：代号不符
+一律先返回 `409 stale_epoch`（**旧代的任何响应都不能推进水位**），代号通过后才校验
+`after`。
+
+### 题面示例
+
+空态集群，事务 T 向两库写 `k=null`：成功后 `GET /snapshot` 返回游标 1、两库均含
+`k:null`；`POST /changes {"after":0}` 仅得到 T 这一批（seq=1）；
+`{"after":1}` 返回 `{"cursor":1,"batches":[]}`。
+
+### changefeed 验收场景（`changefeed_acceptance_test.py`，112 项断言）
+
+| 编号 | 覆盖点 |
+|---|---|
+| C1 | 空态快照游标 0、双库空；题面示例 T 写 `k=null` 后游标 1、双库 `k:null`、after=0 仅一批 |
+| C2 | seq 从 1 连续、撤销不占号；空写集/同值覆盖批次保留；分页续取拼接与全量一致、重放==快照 |
+| C3 | after 校验：非负整数、禁布尔/浮点/字符串/null/负数；超水位 409 定位 after，非法 400 定位 after |
+| C4 | 8 事务交错准备并发提交：seq 连续无空洞、两库各按序应用一次、重放与快照逐位一致 |
+| C5 | 双库 commit 丢应答：重试收敛、不增号、两库各只应用一次 |
+| C6 | 半批强退与“双库已应用水位未落盘”强退：沿用 seq 补齐、不漏不重、水位单调、后续序号接续 |
+| C7 | fenced 接管：守卫优先于 after；旧代 `/snapshot`、`/changes`、提交全 409 且不推进水位；跨代 seq 连续；重放与快照一致 |
+| C8 | 未启用 `--changefeed`：两接口 404、原 2PC 协议不变、changelog/cf_meta 无记录 |
 
 ## 验收场景（`acceptance_test.py`）
 

@@ -61,6 +61,20 @@ def validate_epoch(value, field="epoch"):
     return value
 
 
+def validate_nonneg_integer(value, field="after"):
+    """校验续采游标 after：必须是非负整数（0 合法，表示从头取全部批次）。
+
+    明确拒绝 bool（True/False 是 int 子类）、浮点、字符串、None 与负数；
+    非法时抛 BadRequest 并把错误定位到 after 字段。
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise BadRequest(
+            "%s: 必须是非负整数（禁止布尔/浮点/字符串/负数，实际: %r）"
+            % (field, value)
+        )
+    return value
+
+
 def validate_transaction(obj):
     """校验提交 JSON。
 
