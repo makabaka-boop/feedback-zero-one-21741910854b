@@ -31,7 +31,7 @@ import urllib.parse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from common import canonical_writes  # noqa: E402
+from common import canonical_request  # noqa: E402
 PY = sys.executable
 WORK = os.path.join(HERE, "run_fence")
 
@@ -165,27 +165,29 @@ def forget_local_epoch(gen=None):
 
 
 def insert_pending(txid, writes):
-    """以与协调者完全一致的规范化 BLOB 登记一个 PENDING 事务。"""
+    """以与协调者完全一致的规范化 BLOB 登记一个 PENDING 事务（guards 全空）。"""
     conn = sqlite3.connect(SHARED_COORD_DB, timeout=10)
     try:
         with conn:
             conn.execute(
                 "INSERT INTO txn(txid,writes,state) VALUES(?,?,?)",
-                (txid, canonical_writes(writes), "PENDING"),
+                (txid, canonical_request(writes, {"db1": [], "db2": []}),
+                 "PENDING"),
             )
     finally:
         conn.close()
 
 
 def insert_committed(txid, writes):
-    """登记一个已落盘 COMMIT 决定（模拟旧代强退现场）。"""
+    """登记一个已落盘 COMMIT 决定（模拟旧代强退现场，guards 全空）。"""
     conn = sqlite3.connect(SHARED_COORD_DB, timeout=10)
     try:
         with conn:
             conn.execute(
                 "INSERT INTO txn(txid,writes,state,decided_at) "
                 "VALUES(?,?,?,datetime('now'))",
-                (txid, canonical_writes(writes), "COMMITTED"),
+                (txid, canonical_request(writes, {"db1": [], "db2": []}),
+                 "COMMITTED"),
             )
     finally:
         conn.close()

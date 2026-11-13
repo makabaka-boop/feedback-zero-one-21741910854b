@@ -8,11 +8,13 @@
 
 | 文件 | 作用 |
 |---|---|
-| `common.py` | 输入校验（txid/key 标识规则、写集规范化、epoch 正整数校验）、HTTP 客户端工具（可携带 epoch） |
-| `shard.py` | 分库（参与者）进程：prepare/commit/abort、键锁、持久终态、故障注入、代安装与代号守卫 |
+| `common.py` | 输入校验（txid/key 标识规则、写集规范化、guards 范围守卫校验、epoch 正整数校验）、新旧内容 BLOB 兼容解析、HTTP 客户端工具（可携带 epoch） |
+| `shard.py` | 分库（参与者）进程：prepare/commit/abort、写键锁与范围锁、守卫条件原子核对、持久终态、故障注入、代安装与代号守卫 |
 | `coordinator.py` | 协调者进程：事务登记、2PC 驱动、持久决定、重启恢复、一致查询、fenced 代（epoch）领号与接管 |
-| `acceptance_test.py` | 三进程端到端验收（含两类强退与三类通信故障） |
+| `acceptance_test.py` | 三进程端到端验收（含两类强退与三类通信故障），88 项断言 |
 | `fence_acceptance_test.py` | fenced 代模式验收：双协调进程滚动接管、强退、迟到代消息、线性一致（99 项断言） |
+| `guard_acceptance_test.py` | guards 范围守卫验收：幻影插入、重叠范围、真实 null、丢应答不重验、强退接管、票与锁（154 项断言） |
+| `guard_fence_acceptance_test.py` | fenced × guards 联合验收：范围锁跨代安装保留、无决定/半批接管、stale 不重验（41 项断言） |
 | `run_demo.sh` | 手动启动三进程演示（`./run_demo.sh` 普通模式 / `./run_demo.sh fenced` 代模式） |
 
 运行要求：Python 3.8+，无第三方依赖。所有命令建议用 `python3 -I` 运行。
@@ -20,9 +22,11 @@
 ## 启动
 
 ```bash
-# 一键验收（自动拉起/强退/重启三个进程，结束自动清理）
-python3 -I acceptance_test.py        # 普通模式，88 项断言
-python3 -I fence_acceptance_test.py  # fenced 代模式，99 项断言
+# 一键验收（自动拉起/强退/重启进程，结束自动清理）
+python3 -I acceptance_test.py              # 普通模式，88 项断言
+python3 -I fence_acceptance_test.py        # fenced 代模式，99 项断言
+python3 -I guard_acceptance_test.py        # guards 范围守卫，154 项断言
+python3 -I guard_fence_acceptance_test.py  # fenced × guards 联合，41 项断言
 
 # 手动演示
 ./run_demo.sh            # 普通模式
@@ -47,6 +51,47 @@ python3 -I fence_acceptance_test.py  # fenced 代模式，99 项断言
   （与键不存在相区别）。初始两库均为空。
 * 非法输入返回 `400` 且错误信息定位到具体字段（如 `writes.db1.k: ...`），**不建事务**。
 
+### 可选 guards（范围守卫）
+
+`/submit` 可带可选字段 `guards`，恰含 `db1`、`db2`，各为**检查项数组**；省略
+`guards` 等同两库均为空数组（旧事务按此处理，响应与旧协议完全兼容）。
+
+```json
+{
+  "txid": "tx002",
+  "writes": {"db1": {"k9": "x"}, "db2": {}},
+  "guards": {
+    "db1": [["a", "c", {}], ["m", null, {"m1": "v", "m2": null}]],
+    "db2": []
+  }
+}
+```
+
+每个检查项是三元组 `[lo, hi, expected]`：
+
+* `lo`、`hi` 是**原键或 `null`**（`null` 端对应无穷），按 ASCII 定义左闭右开
+  范围 `[lo, hi)`，须满足 `lo <= hi`；`lo == hi`（两端均非 null）是空范围。
+* `expected` 是 key→字符串或 `null` 的映射，取值规则沿用写集；每个键必须落在
+  本项范围内。它要求**恰等于本分库 prepare 时已提交的范围快照**：键缺失不同于
+  值为 `null`（缺键不得写进 expected，写 `null` 表示该键存在且值为 null）。
+* 非法检查返回 `400`，错误定位到 `guards.<库>[<零基项号>].<字段>`，且不建事务。
+
+锁与裁决规则（同库内全部检查、范围锁、写键锁在**一个原子事务**内同时成功）：
+
+* **范围锁互相兼容**：多个事务可同时持有交叠甚至相同的范围锁（空检查也持锁，
+  仅空范围 `[x,x)` 例外——空范围不产生任何锁）。
+* **范围锁与其他事务范围内的写键锁互斥**（双向）：写键落入他人守卫范围、或新
+  守卫覆盖他人写键，都立即反对；**自身读写不冲突**（自己的写键对自己的守卫可见
+  性无影响，准备值本就不参与快照）。
+* 守卫条件不匹配或任一锁冲突：持久投 `ABORTED` 且**不留任何锁**。
+* 判断顺序固定为：代号 → 同号内容（写集与 guards 整体）→ 锁 → 守卫条件 → 终态；
+  同号同内容的重试**不重新验证** guards，终态票（COMMITTED/ABORTED）永不反转。
+* 范围锁与写键锁一样**跨分库重启和代安装持久保留，只有事务终结（commit/abort）
+  才释放**；协调者重启或新代接管时，已有提交决定的恢复不重验 guards。
+
+**题面示例**：空库 prepare 检查 `["a","c",{}]` 后，另一事务写 `b`（范围内）被
+反对，写 `c`（右开边界外）可准备；两份同范围空检查可同时 prepare。
+
 ## HTTP 接口
 
 ### 协调者（默认 19010）
@@ -65,13 +110,13 @@ python3 -I fence_acceptance_test.py  # fenced 代模式，99 项断言
 | 方法/路径 | 说明 |
 |---|---|
 | `POST /install` | fenced 专用：安装代 `{"epoch":N}`；同代幂等、低代 409 拒绝、高代原子提升；不动准备/锁/终态 |
-| `POST /prepare` | 持久写集并独占键锁；锁冲突立即投反对票（不等待）；不改可见数据 |
+| `POST /prepare` | 持久内容并独占写键锁与守卫范围锁、原子核对 guards；锁冲突/条件不符立即投反对票（不等待）；不改可见数据 |
 | `POST /commit` | 仅 PREPARED 可提交；原子应用写集、释放锁；重复调用幂等 |
 | `POST /abort` | 丢弃准备并释放锁；**先于 prepare 到达也持久记 ABORTED** |
 | `GET /txn/{txid}/status` | 分库侧状态 `PREPARED/COMMITTED/ABORTED` |
 | `GET /data` | 仅已提交数据，按 key 字节序（fenced 下须带代） |
 | `GET /debug/epoch` | 观测：分库是否 fenced 与已安装代（无代号守卫） |
-| `GET /debug/locks`、`/debug/stats` | 持锁视图、应用计数（验收幂等用） |
+| `GET /debug/locks`、`/debug/stats` | 持锁视图（含 `range_locks` 范围锁）、应用与 `guard_eval`/`guard_mismatch` 计数（验收幂等/不重验用） |
 | `POST /control/drop-next` | `{"phase":"prepare|commit|abort"}`：下一次该接口落盘后丢弃应答 |
 | `POST /control/delay-next` | `{"phase":...,"seconds":N}`：下一次该接口落盘后延迟应答（制造接管竞态） |
 
@@ -79,11 +124,13 @@ python3 -I fence_acceptance_test.py  # fenced 代模式，99 项断言
 
 1. **先持久登记，再通信**：协调者 `/submit` 先把事务写入本地 SQLite（PENDING），
    之后才发起 prepare。
-2. **交错 prepare + 键锁**：分库把写集和 `(txid,key)` 锁持久化；任一键已被其他
-   事务持有就立即返回反对（本库同时持久 ABORTED），不阻塞等待。PREPARED 期间
-   数据对外不可见。
-3. **内容固定**：同 txid 的写集以首次内容为准（规范化 JSON 落盘），异内容一律
-   `409` 拒绝，且**内容判断先于锁冲突判断**；协调者侧重提异内容同样直接拒绝。
+2. **交错 prepare + 写键锁/范围锁**：分库把事务内容、`(txid,key)` 写键锁与
+   `(txid,lo,hi)` 范围锁持久化；写键被他人持有、落入他人守卫范围、或新守卫覆盖
+   他人写键，都立即返回反对（本库同时持久 ABORTED，不留任何锁），不阻塞等待。
+   范围锁彼此兼容；PREPARED 期间数据对外不可见，guards 只核对已提交快照。
+3. **内容固定**：同 txid 的内容以首次为准（规范化 JSON 落盘，**写集与 guards
+   整体参与判定**，任一不同即异内容），异内容一律 `409` 拒绝，且**内容判断先于
+   锁冲突与守卫条件判断**；协调者侧重提异内容同样直接拒绝。
 4. **决定持久且不可逆**：全赞成才落盘 COMMIT，任一反对落盘 ABORT；未收齐应答
    可无限等待/重试，**从不以超时推翻决定**。决定落盘后重发通知，分库幂等应答。
 5. **终态语义**：分库 COMMITTED/ABORTED 永不反转；abort 先到时持久 ABORTED，
@@ -185,3 +232,34 @@ commit 补发给 db2，最终**两库 k 均为 "a"**，db1 不重复应用；此
 10. 分库断连：宕机期间协调者保持 PENDING 不以超时作决定，恢复后整批提交完成
 
 共 88 项断言，可重复运行（每轮清空 `run_acceptance/` 重建进程与库）。
+
+## guards 验收场景
+
+`guard_acceptance_test.py`（普通模式，154 项断言，G7 后重建干净集群隔离数据）：
+
+| 编号 | 覆盖点 |
+|---|---|
+| G1 | 题面示例：空库 `[a,c)` 空检查持锁；写 b 反对、写 c（右开外）可准备；同范围空检查共存；终结释放 |
+| G2 | 幻影插入：守卫持锁期间范围内新键整批 abort、范围外正常提交、终结后放行 |
+| G3 | 真实 null：显式 null 与缺键不同；漏报/错报/多报均反对；精确快照与 null 无穷端点 |
+| G4 | 范围锁互相兼容；范围锁↔他人写键锁双向互斥；左闭边界；空范围不持锁不挡写 |
+| G5 | ASCII 左闭右开、多字符字节序（`k10 < k2`）、双侧无穷全范围挡任意写键 |
+| G6 | 冲突/不匹配持久 ABORTED 且无任何残留锁；ABORTED 终态不反转 |
+| G7 | 20 组非法 guards 逐字段/零基项号定位 400 且不建事务；省略与两空数组等价 |
+| G8 | 丢应答重发幂等、`guard_eval` 只增一次（重试不重验）；协调者路径同样收敛 |
+| G9 | 范围锁/写键锁跨分库重启保留且仍生效；协调者强退后恢复撤销、锁全释放、值不可见 |
+| G10 | 真实并发：同范围守卫共存；delay 制造持锁窗口，范围内/外写并发裁决正确 |
+| G11 | 终态重复 prepare 不重验；同号异 guards/异写集均 409（guards 纳入内容判定） |
+
+`guard_fence_acceptance_test.py`（fenced × guards，41 项断言）：
+
+| 编号 | 覆盖点 |
+|---|---|
+| H1 | 代内带 guards 整批提交与幻影 abort；校验顺序（epoch 类型→代号→guards） |
+| H2 | 范围锁跨 `/install` 代提升保留，新代受旧范围锁约束，终结才释放 |
+| H3 | 无决定接管：持范围锁的 PENDING 被新代撤销，两类锁全释放，准备值不可见 |
+| H4 | 半批接管：guards 事务已决定提交仅一库应用，新代补齐双库并释放范围锁 |
+| H5 | 旧代 prepare 409 stale 不留痕不促成决定；当代丢应答重试不重验；异内容 409 |
+
+旧库兼容：无 `rangelocks` 表或 `hi` 误建为 NOT NULL 的旧分库文件，启动时自动
+建表/迁移；旧格式内容 BLOB（仅写集）按 guards 全空解析，旧数据与终态原样保留。

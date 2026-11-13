@@ -4,16 +4,21 @@
 
 持久状态（SQLite，单库内一个线程锁串行化所有写事务）：
   kv(k)            可见数据：仅已 commit 的写集可被 /data 看到
-  txn(txid)        事务记录：状态 + 首次写集（PREPARED / COMMITTED / ABORTED）
-  locks(txid,k)    PREPARED 事务持有的键锁
+  txn(txid)        事务记录：状态 + 首次内容（写集+guards）（PREPARED/COMMITTED/ABORTED）
+  locks(txid,k)    PREPARED 事务持有的写键锁
+  rangelocks(txid,lo,hi)  PREPARED 事务持有的范围锁（lo/hi 可为 NULL 表无穷）
   stats            应用次数等幂等观测计数
 
 关键规则：
-  * prepare 不改动可见数据，只持久写集并独占其键；锁冲突立即反对，不等待；
-  * txid 首次内容固定，异内容一律拒绝，且内容判断先于锁冲突判断；
+  * prepare 不改动可见数据，只持久内容并独占其写键与守卫范围；锁冲突立即反对，
+    不等待；同库的全部守卫检查、共享范围锁与写键锁在一个原子事务内同时成功；
+  * 范围锁按 ASCII 左闭右开 [lo,hi)，null 端为无穷，空范围（lo==hi）不持锁；
+    范围锁彼此兼容，与其他事务范围内的写键锁互斥，自身读写不冲突；
+  * 守卫条件 expected 必须恰等于 prepare 时已提交范围快照（显式 null 与缺键不同）；
+  * txid 首次内容固定（含 guards），异内容一律拒绝，且内容判断先于锁/条件判断；
   * abort 即使先于 prepare 到达也持久记终态 ABORTED，迟到 prepare 不复活；
-  * 终态 COMMITTED/ABORTED 永不反转；重复 prepare/commit/abort 幂等；
-  * commit 原子应用写集（含 null 写入/替换）并释放锁。
+  * 终态 COMMITTED/ABORTED 永不反转；重复 prepare/commit/abort 幂等，重试不重验；
+  * commit 原子应用写集（含 null 写入/替换）并释放写键锁与范围锁。
 
 fenced（代）模式（--fenced 开启，未开启时行为与旧协议完全一致）：
   * meta 表持久保存已安装的最大代 max_epoch；/install 同代幂等、低代拒绝、
@@ -40,8 +45,10 @@ from common import (  # noqa: E402
     Conflict,
     SHARDS,
     StaleEpoch,
-    canonical_writes,
+    canonical_request,
+    parse_request_blob,
     validate_epoch,
+    validate_guards,
     validate_transaction,
 )
 
@@ -99,6 +106,30 @@ class ShardStore:
                 " txid TEXT NOT NULL, k TEXT NOT NULL,"
                 " PRIMARY KEY (txid, k))"
             )
+            # 范围锁：lo/hi 为 NULL 表示该侧无穷（左闭右开 [lo, hi)）。
+            # 两侧均可为 NULL（全范围 [null,null)），故均不加 NOT NULL；
+            # 不建唯一约束：SQLite 中 NULL 互不相等，去重在应用层按行集保证。
+            self.conn.execute(
+                "CREATE TABLE IF NOT EXISTS rangelocks ("
+                " txid TEXT NOT NULL, lo TEXT, hi TEXT)"
+            )
+            # 旧库兼容：若历史表结构把 hi 误建为 NOT NULL，迁移为可空
+            cols = self.conn.execute("PRAGMA table_info(rangelocks)").fetchall()
+            for cid, name, ctype, notnull, dflt, pk in cols:
+                if name == "hi" and notnull:
+                    self.conn.execute(
+                        "CREATE TABLE rangelocks_new ("
+                        " txid TEXT NOT NULL, lo TEXT, hi TEXT)"
+                    )
+                    self.conn.execute(
+                        "INSERT INTO rangelocks_new(txid,lo,hi) "
+                        "SELECT txid,lo,hi FROM rangelocks"
+                    )
+                    self.conn.execute("DROP TABLE rangelocks")
+                    self.conn.execute(
+                        "ALTER TABLE rangelocks_new RENAME TO rangelocks"
+                    )
+                    break
             self.conn.execute(
                 "CREATE TABLE IF NOT EXISTS stats ("
                 " name TEXT PRIMARY KEY, val INTEGER NOT NULL DEFAULT 0)"
@@ -169,11 +200,63 @@ class ShardStore:
         )
 
     # ------------------------------------------------------------ prepare
-    def prepare(self, txid, norm, epoch=None):
-        """返回 (state, note)。state ∈ PREPARED/ABORTED/COMMITTED。"""
+    def _write_key_holder(self, k):
+        """其他事务是否持有包含写键 k 的范围锁（自身不与自身冲突，
+        调用处对新事务尚无任何锁，故这里命中的一律是其他事务）。"""
+        return self.conn.execute(
+            "SELECT txid, lo, hi FROM rangelocks "
+            "WHERE (lo IS NULL OR lo <= ?) AND (hi IS NULL OR ? < hi) LIMIT 1",
+            (k, k),
+        ).fetchone()
+
+    def _range_overlaps_writelock(self, lo, hi):
+        """范围 [lo,hi) 是否与其他事务的写键锁相交（lo/hi 为 None 表无穷）。"""
+        if lo is None and hi is None:
+            return self.conn.execute(
+                "SELECT txid, k FROM locks LIMIT 1"
+            ).fetchone()
+        if lo is None:
+            return self.conn.execute(
+                "SELECT txid, k FROM locks WHERE k < ? LIMIT 1", (hi,)
+            ).fetchone()
+        if hi is None:
+            return self.conn.execute(
+                "SELECT txid, k FROM locks WHERE ? <= k LIMIT 1", (lo,)
+            ).fetchone()
+        return self.conn.execute(
+            "SELECT txid, k FROM locks WHERE ? <= k AND k < ? LIMIT 1",
+            (lo, hi),
+        ).fetchone()
+
+    def _eval_guards(self, guards):
+        """在原子 prepare 事务内核对全部检查项。
+
+        expected 须恰等于当前“已提交”范围内的快照；准备值不可见、不参与。
+        返回首个不匹配项的 (lo, hi, expected, actual)，全部匹配返回 None。
+        """
+        for lo, hi, expected in guards:
+            rows = self.conn.execute(
+                "SELECT k, v FROM kv "
+                "WHERE (? IS NULL OR ? <= k) AND (? IS NULL OR k < ?)",
+                (lo, lo, hi, hi),
+            ).fetchall()
+            actual = {k: v for k, v in rows}
+            if actual != expected:
+                return lo, hi, expected, actual
+        return None
+
+    def prepare(self, txid, norm, guards, epoch=None):
+        """返回 (state, note)。state ∈ PREPARED/ABORTED/COMMITTED。
+
+        新事务在同一个 SQLite 写事务内原子完成：
+          写键锁冲突 -> 范围锁冲突（与其他事务写键锁）-> 守卫条件；
+        任一失败持久投 ABORTED 且不留任何锁；全部成功才持锁并 PREPARED。
+        范围锁互相兼容，可多事务同时持有；空范围不持锁。
+        """
         self.check_epoch(epoch)  # 代号不符：StaleEpoch，不触碰任何状态
-        writes_blob = canonical_writes(norm)
+        content_blob = canonical_request(norm, guards)
         keys = sorted(norm[self.name].keys())
+        my_guards = guards[self.name]
         with self.lock, self.conn:
             row = self.conn.execute(
                 "SELECT state, writes FROM txn WHERE txid=?", (txid,)
@@ -181,47 +264,90 @@ class ShardStore:
 
             if row is not None:
                 state, blob = row
-                # 撤销先到：从未登记过写集，任何迟到 prepare 都不得复活，
+                # 撤销先到：从未登记过内容，任何迟到 prepare 都不得复活，
                 # 直接返回终态票（内容比对对该占位行不适用）
                 if state == ABORTED and blob == EARLY_ABORT_BLOB:
                     return ABORTED, "撤销先于准备到达，迟到 prepare 不得复活"
-                # 内容判断先于锁冲突判断，且对任何已有记录生效
-                if blob != writes_blob:
+                # 内容判断（含 guards）先于锁冲突与条件判断，且对任何已有记录生效
+                if blob != content_blob:
                     raise Conflict(
-                        "txid %s: 写集内容与首次登记不一致（异内容拒绝）" % txid
+                        "txid %s: 提交内容（含 guards）与首次登记不一致"
+                        "（异内容拒绝）" % txid
                     )
                 if state == PREPARED:
-                    return PREPARED, "重复 prepare，幂等返回"
+                    # 重试不重验：同号同内容直接幂等返回，不再核对锁与条件
+                    return PREPARED, "重复 prepare，幂等返回（不重验 guards）"
                 if state == COMMITTED:
                     return COMMITTED, "事务已提交，重复 prepare 幂等"
                 # ABORTED：终态不可逆，迟到 prepare 不得复活
                 return ABORTED, "事务已撤销，终态不可反转"
 
-            # 新事务：先检查全部键锁，任一被其他事务持有 -> 立即反对，不等待
+            # ---- 新事务：先代号/内容，再锁与条件，全部原子成功才持锁 ----
+            # 1) 写键锁：任一键已被其他事务持有 -> 立即反对，不等待
             for k in keys:
                 holder = self.conn.execute(
                     "SELECT txid FROM locks WHERE k=? LIMIT 1", (k,)
                 ).fetchone()
                 if holder is not None:
-                    # 反对也持久登记终态（记录本次写集），不持锁
-                    self.conn.execute(
-                        "INSERT INTO txn(txid,state,writes) VALUES(?,?,?)",
-                        (txid, ABORTED, writes_blob),
-                    )
-                    self._bump("prepare_conflict")
-                    return ABORTED, "键 %s 被事务 %s 持锁，立即反对" % (k, holder[0])
+                    self._persist_prepare_abort(txid, content_blob)
+                    return ABORTED, "键 %s 被事务 %s 持锁，立即反对" % (
+                        k, holder[0])
+                # 写键也不得落入其他事务的守卫范围（范围锁 vs 写键锁互斥）
+                rholder = self._write_key_holder(k)
+                if rholder is not None:
+                    self._persist_prepare_abort(txid, content_blob)
+                    return ABORTED, (
+                        "键 %s 落入事务 %s 的守卫范围 [%r,%r)，立即反对"
+                        % (k, rholder[0], rholder[1], rholder[2]))
 
-            # 全赞成路径：持久保存写集并独占其键（准备不改可见数据）
+            # 2) 范围锁：与其他事务范围内的写键锁互斥；范围锁之间兼容
+            for lo, hi, _expected in my_guards:
+                if lo is not None and lo == hi:
+                    continue  # 空范围不持锁
+                holder = self._range_overlaps_writelock(lo, hi)
+                if holder is not None:
+                    self._persist_prepare_abort(txid, content_blob)
+                    return ABORTED, (
+                        "守卫范围 [%r,%r) 与事务 %s 的写键 %s 冲突，立即反对"
+                        % (lo, hi, holder[0], holder[1]))
+
+            # 3) 守卫条件：expected 须恰等于已提交范围快照
+            self._bump("guard_eval")
+            mismatch = self._eval_guards(my_guards)
+            if mismatch is not None:
+                lo, hi, expected, actual = mismatch
+                self._persist_prepare_abort(txid, content_blob)
+                self._bump("guard_mismatch")
+                return ABORTED, (
+                    "守卫条件不匹配：范围 [%r,%r) 期望 %r，实际已提交 %r"
+                    % (lo, hi, expected, actual))
+
+            # 全赞成路径：持久保存内容、独占写键，并登记共享范围锁
             self.conn.execute(
                 "INSERT INTO txn(txid,state,writes) VALUES(?,?,?)",
-                (txid, PREPARED, writes_blob),
+                (txid, PREPARED, content_blob),
             )
             for k in keys:
                 self.conn.execute(
                     "INSERT INTO locks(txid,k) VALUES(?,?)", (txid, k)
                 )
+            for lo, hi, _expected in my_guards:
+                if lo is not None and lo == hi:
+                    continue  # 空范围不锁
+                self.conn.execute(
+                    "INSERT INTO rangelocks(txid,lo,hi) VALUES(?,?,?)",
+                    (txid, lo, hi),
+                )
             self._bump("prepare_yes")
             return PREPARED, "已准备"
+
+    def _persist_prepare_abort(self, txid, content_blob):
+        """冲突或不匹配：持久投 ABORTED，且不留任何锁。"""
+        self.conn.execute(
+            "INSERT INTO txn(txid,state,writes) VALUES(?,?,?)",
+            (txid, ABORTED, content_blob),
+        )
+        self._bump("prepare_conflict")
 
     # ------------------------------------------------------------ commit
     def commit(self, txid, epoch=None):
@@ -238,8 +364,9 @@ class ShardStore:
             if state == ABORTED:
                 raise Conflict("txid %s: 已撤销，终态不可反转为提交" % txid)
 
-            # PREPARED -> 原子应用写集并释放锁
-            writes = json.loads(blob.decode("utf-8"))[self.name]
+            # PREPARED -> 原子应用写集并释放写键锁与范围锁（终结才释放）
+            norm, _guards = parse_request_blob(blob)
+            writes = norm[self.name]
             for k in sorted(writes.keys()):
                 # 新增或替换；值为 None 时写 SQL NULL，区别于键不存在
                 self.conn.execute(
@@ -248,11 +375,12 @@ class ShardStore:
                     (k, writes[k]),
                 )
             self.conn.execute("DELETE FROM locks WHERE txid=?", (txid,))
+            self.conn.execute("DELETE FROM rangelocks WHERE txid=?", (txid,))
             self.conn.execute(
                 "UPDATE txn SET state=? WHERE txid=?", (COMMITTED, txid)
             )
             self._bump("commit_applied")
-            return COMMITTED, "写集已原子应用，锁已释放"
+            return COMMITTED, "写集已原子应用，写键锁与范围锁已释放"
 
     # ------------------------------------------------------------ abort
     def abort(self, txid, epoch=None):
@@ -274,13 +402,14 @@ class ShardStore:
                 return ABORTED, "重复 abort，幂等"
             if state == COMMITTED:
                 raise Conflict("txid %s: 已提交，终态不可反转为撤销" % txid)
-            # PREPARED：丢弃准备并释放锁
+            # PREPARED：丢弃准备并释放写键锁与范围锁
             self.conn.execute("DELETE FROM locks WHERE txid=?", (txid,))
+            self.conn.execute("DELETE FROM rangelocks WHERE txid=?", (txid,))
             self.conn.execute(
                 "UPDATE txn SET state=? WHERE txid=?", (ABORTED, txid)
             )
             self._bump("abort_after_prepare")
-            return ABORTED, "准备已丢弃，锁已释放"
+            return ABORTED, "准备已丢弃，写键锁与范围锁已释放"
 
     # ------------------------------------------------------------ 只读视图
     def data(self):
@@ -303,6 +432,13 @@ class ShardStore:
                 "SELECT txid,k FROM locks ORDER BY txid,k"
             ).fetchall()
         return [{"txid": t, "key": k} for t, k in rows]
+
+    def held_range_locks(self):
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT txid,lo,hi FROM rangelocks ORDER BY txid,lo,hi"
+            ).fetchall()
+        return [{"txid": t, "lo": lo, "hi": hi} for t, lo, hi in rows]
 
     def stats_view(self):
         with self.lock:
@@ -403,7 +539,8 @@ def make_handler(store):
                     self._send(200, {"shard": store.name, "data": store.data()})
                 elif path == "/debug/locks":
                     self._send(200, {"shard": store.name,
-                                     "locks": store.held_locks()})
+                                     "locks": store.held_locks(),
+                                     "range_locks": store.held_range_locks()})
                 elif path == "/debug/stats":
                     self._send(200, {"shard": store.name,
                                      "stats": store.stats_view()})
@@ -435,10 +572,14 @@ def make_handler(store):
                     installed, note = store.install_epoch(epoch)
                     self._send(200, {"ok": True, "epoch": installed, "note": note})
                 elif path == "/prepare":
-                    txid, norm = validate_transaction(obj)
-                    # 校验顺序：类型 -> 代号 -> 内容/锁/终态
+                    # 校验顺序：epoch 类型 -> 事务/guards 结构（400 不建事务）
+                    # -> 代号（store 内 check_epoch，不符 409 不改状态）
+                    # -> 内容/锁/守卫条件/终态
                     epoch = self._request_epoch(obj)
-                    state, note = store.prepare(txid, norm, epoch=epoch)
+                    txid, norm = validate_transaction(obj)
+                    guards = validate_guards(obj, norm)
+                    state, note = store.prepare(
+                        txid, norm, guards, epoch=epoch)
                     if self._maybe_drop("prepare"):
                         return
                     self._maybe_delay("prepare")

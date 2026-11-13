@@ -39,10 +39,12 @@ from common import (  # noqa: E402
     Conflict,
     SHARDS,
     StaleEpoch,
-    canonical_writes,
+    canonical_request,
+    parse_request_blob,
     post_json,
     get_json,
     validate_epoch,
+    validate_guards,
     validate_transaction,
 )
 
@@ -259,8 +261,10 @@ class Coordinator:
     # ---------------------------------------------------------- 提交入口
     def submit(self, obj, epoch=None):
         self._ensure_active()
-        txid, norm = validate_transaction(obj)  # 非法输入：不建事务
-        blob = canonical_writes(norm)
+        # 非法输入（含非法 guards）：400 且不建事务
+        txid, norm = validate_transaction(obj)
+        guards = validate_guards(obj, norm)
+        blob = canonical_request(norm, guards)
 
         with self.inflight_lock:
             worker = None
@@ -268,10 +272,11 @@ class Coordinator:
                 "SELECT state, writes FROM txn WHERE txid=?", (txid,)
             ).fetchone()
             if row is not None:
-                # 同 txid 异内容：先于一切锁/协议判断直接拒绝
+                # 同 txid 异内容（写集或 guards 任一不同）：先于一切锁/协议判断拒绝
                 if row[1] != blob:
                     raise Conflict(
-                        "txid %s: 提交内容与首次登记不一致（异内容拒绝）" % txid
+                        "txid %s: 提交内容（含 guards）与首次登记不一致"
+                        "（异内容拒绝）" % txid
                     )
                 state = row[0]
                 worker = self.inflight.get(txid)
@@ -281,21 +286,21 @@ class Coordinator:
                     self._check_leadership()
                     worker = threading.Thread(
                         target=self._recover_one,
-                        args=(txid, norm, PENDING), daemon=True,
+                        args=(txid, norm, guards, PENDING), daemon=True,
                     )
                     self.inflight[txid] = worker
                     worker.start()
             else:
                 # 只有当前代能登记新事务
                 self._check_leadership()
-                # 先持久登记事务，再进行任何通信
+                # 先持久登记事务（写集+guards 整体内容），再进行任何通信
                 with self.conn:
                     self.conn.execute(
                         "INSERT INTO txn(txid,writes,state) VALUES(?,?,?)",
                         (txid, blob, PENDING),
                     )
                 t = threading.Thread(
-                    target=self._worker, args=(txid, norm), daemon=True
+                    target=self._worker, args=(txid, norm, guards), daemon=True
                 )
                 self.inflight[txid] = t
                 t.start()
@@ -310,11 +315,12 @@ class Coordinator:
         return final
 
     # ---------------------------------------------------------- 2PC 工作流
-    def _worker(self, txid, norm):
+    def _worker(self, txid, norm, guards):
         try:
             votes = {}
             for shard in SHARDS:
-                votes[shard] = self._prepare_until_answer(txid, norm, shard)
+                votes[shard] = self._prepare_until_answer(
+                    txid, norm, guards, shard)
                 # 故障注入点 1：单库 prepare 完成后强退协调者（决定尚未落盘）
                 if self.crash_after_first_prepare:
                     self.crash_after_first_prepare = False
@@ -340,9 +346,12 @@ class Coordinator:
             with self.inflight_lock:
                 self.inflight.pop(txid, None)
 
-    def _prepare_until_answer(self, txid, norm, shard):
-        """向一个分库反复 prepare，直到拿到明确投票；重复投递天然幂等。"""
-        body = {"txid": txid, "writes": norm}
+    def _prepare_until_answer(self, txid, norm, guards, shard):
+        """向一个分库反复 prepare，直到拿到明确投票；重复投递天然幂等。
+
+        同号同内容的重发由分库幂等返回，guards 不会被重新验证（重试不重验）。
+        """
+        body = {"txid": txid, "writes": norm, "guards": guards}
         i = 0
         while True:
             self._ensure_active()
@@ -449,12 +458,12 @@ class Coordinator:
         """
         rows = self.conn.execute("SELECT txid, writes, state FROM txn").fetchall()
         for txid, blob, state in rows:
-            if isinstance(blob, str):  # 兼容被外部以 TEXT 写入的记录
-                blob = blob.encode("utf-8")
-            norm = json.loads(blob.decode("utf-8"))
+            # 兼容旧格式 BLOB：旧事务按 guards 全空处理（省略等同两空数组）
+            norm, guards = parse_request_blob(blob)
             # 恢复期间重新登记 inflight，供 /status 观测
             t = threading.Thread(
-                target=self._recover_one, args=(txid, norm, state), daemon=True
+                target=self._recover_one,
+                args=(txid, norm, guards, state), daemon=True
             )
             with self.inflight_lock:
                 self.inflight[txid] = t
@@ -463,7 +472,7 @@ class Coordinator:
         for t in list(self.inflight.values()):
             t.join()
 
-    def _recover_one(self, txid, norm, state):
+    def _recover_one(self, txid, norm, guards, state):
         try:
             if state == PENDING:
                 # 无决定的事务撤销（即使某分库已 prepare，abort 亦安全）

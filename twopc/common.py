@@ -127,6 +127,137 @@ def canonical_writes(norm):
     ).encode("utf-8")
 
 
+def _validate_guard_endpoint(value, field):
+    """校验范围端点：必须是原键（非空 ASCII 字母数字串）或 null（无穷）。"""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise BadRequest(
+            "%s: 必须是原键（非空 ASCII 字母数字串）或 null（实际: %r）"
+            % (field, value)
+        )
+    if not _IDENT_RE.match(value):
+        raise BadRequest(
+            "%s: 必须是非空 ASCII 字母数字串或 null（实际: %r）" % (field, value)
+        )
+    return value
+
+
+def validate_guards(obj, norm):
+    """校验可选 guards 字段，返回规范化检查项。
+
+    结构：{"guards": {"db1": [[lo, hi, expected], ...], "db2": [...]}}
+      * 省略 guards 等同两库均为空数组；若出现则必须恰含 db1、db2；
+      * 每项恰为 3 元素数组；lo/hi 为原键或 null（null 端对应无穷），
+        按 ASCII 满足 lo<=hi；范围为左闭右开 [lo, hi)；
+      * expected 是 key->字符串或 null 的映射（沿用写集取值规则），
+        每个键必须落在本项范围内；显式 null 值与键缺失是两回事，
+        因此 expected 里写 null 表示要求该键存在且值为 null；
+      * 空范围（lo==hi，两端均非 null）合法：不产生范围锁，
+        其 expected 只能为空映射（任何键都不可能落在空范围内）。
+    非法输入抛 BadRequest，错误定位到 guards.<库>[<零基项号>].<字段>。
+    """
+    if "guards" not in obj:
+        return {s: [] for s in SHARDS}
+    guards = obj["guards"]
+    if not isinstance(guards, dict):
+        raise BadRequest("guards: 必须是对象")
+    if set(guards.keys()) != set(SHARDS):
+        raise BadRequest(
+            "guards: 必须恰含两个库 db1 与 db2（实际键: %r）"
+            % sorted(guards.keys())
+        )
+
+    out = {}
+    for shard in SHARDS:
+        items = guards[shard]
+        if not isinstance(items, list):
+            raise BadRequest("guards.%s: 必须是检查项数组" % shard)
+        norm_items = []
+        for idx, item in enumerate(items):
+            base = "guards.%s[%d]" % (shard, idx)  # 零基项号
+            if not isinstance(item, list) or len(item) != 3:
+                raise BadRequest(
+                    "%s: 检查项必须是恰含 3 个元素的数组 [lo, hi, expected]"
+                    % base
+                )
+            lo, hi, expected = item
+            lo = _validate_guard_endpoint(lo, base + ".lo")
+            hi = _validate_guard_endpoint(hi, base + ".hi")
+            if lo is not None and hi is not None and lo > hi:
+                raise BadRequest(
+                    "%s.hi: 端点须满足 lo<=hi（实际 lo=%r hi=%r）"
+                    % (base, lo, hi)
+                )
+            if not isinstance(expected, dict):
+                raise BadRequest(
+                    "%s.expected: 必须是键到字符串或 null 的映射" % base
+                )
+            exp = {}
+            for key, val in expected.items():
+                if not isinstance(key, str) or not key \
+                        or not _IDENT_RE.match(key):
+                    raise BadRequest(
+                        "%s.expected: 键必须是非空 ASCII 字母数字串（实际: %r）"
+                        % (base, key)
+                    )
+                if val is not None and not isinstance(val, str):
+                    raise BadRequest(
+                        "%s.expected.%s: 值必须是字符串或 null（实际: %r）"
+                        % (base, key, val)
+                    )
+                # 键须在 [lo, hi) 内；null 端为无穷，不施加该侧约束
+                if lo is not None and key < lo:
+                    raise BadRequest(
+                        "%s.expected.%s: 键 %r 不在范围 [%r, %r) 内"
+                        % (base, key, key, lo, hi)
+                    )
+                if hi is not None and not key < hi:
+                    raise BadRequest(
+                        "%s.expected.%s: 键 %r 不在范围 [%r, %r) 内"
+                        % (base, key, key, lo, hi)
+                    )
+                exp[key] = val
+            norm_items.append([lo, hi, exp])
+        out[shard] = norm_items
+    return out
+
+
+def canonical_request(norm, guards):
+    """规范化整份事务内容（写集 + guards）为稳定字节串。
+
+    同 txid 的内容判定包含 guards：任一部分不同即异内容。
+    """
+    payload = {
+        "writes": {s: dict(sorted(norm[s].items())) for s in SHARDS},
+        "guards": {
+            s: [[lo, hi, dict(sorted(exp.items()))]
+                for lo, hi, exp in guards[s]]
+            for s in SHARDS
+        },
+    }
+    return json.dumps(
+        payload,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def parse_request_blob(blob):
+    """解析持久化的事务内容 BLOB，返回 (norm_writes, norm_guards)。
+
+    兼容旧格式（仅写集的 {"db1":..,"db2":..}）：旧事务按 guards 全空处理。
+    """
+    if isinstance(blob, str):  # 兼容被外部以 TEXT 写入的记录
+        blob = blob.encode("utf-8")
+    obj = json.loads(blob.decode("utf-8"))
+    if isinstance(obj, dict) and "writes" in obj and "guards" in obj:
+        return obj["writes"], obj["guards"]
+    # 旧格式 BLOB：顶层恰为两库写集
+    return obj, {s: [] for s in SHARDS}
+
+
 # ---------------------------------------------------------------- HTTP 客户端
 
 def _with_epoch(path, epoch):
