@@ -20,6 +20,19 @@ fenced（代）模式（--fenced 开启，未开启时与旧行为完全兼容�
     收到即自我 fence-out，停止一切写动作，新客户端请求一律 409；
   * 落决定前再核对代账最大值，只有当前代能登记事务或持久决定；
   * 接管沿用原 txid 及内容；旧代的任何响应/错误都不能促成新决定。
+
+undo 撤回模式（--undo 开启，可与 --fenced 并用；未启用时 POST /undo 404）：
+  * POST /undo 接收 {"txid","target"}，标识规则沿用；撤回是一个新事务，
+    与 /submit 共用 txid 号空间：先沿用代号守卫，再判同号内容（含类型与
+    target），同内容返回原结局，异内容 409；
+  * target 必须是两库均已完成的普通提交，其他情况及已成功撤回返回 409
+    且不占号（不登记新事务）；
+  * 撤回走同一套 2PC：分库 prepare-undo 持原写键锁并核对最后写者仍为
+    target，冲突或不符整批 ABORTED；失败可换号重试，同 target 至多一次
+    成功；空写集目标也可撤回；
+  * 原 target 终态保持 COMMITTED 不变；撤回自身终态为 COMMITTED/ABORTED；
+  * 重启接管沿用普通恢复规则：无决定撤销、有决定补齐，分库镜像与写者
+    保证撤回提交不重复应用。
 """
 
 import argparse
@@ -39,11 +52,13 @@ from common import (  # noqa: E402
     Conflict,
     SHARDS,
     StaleEpoch,
+    canonical_undo,
     canonical_writes,
     post_json,
     get_json,
     validate_epoch,
     validate_transaction,
+    validate_undo,
 )
 
 PENDING, COMMITTED, ABORTED = "PENDING", "COMMITTED", "ABORTED"
@@ -58,11 +73,14 @@ class FencedOut(Exception):
 
 class Coordinator:
     def __init__(self, dbpath, shard_urls, fenced=False,
-                 crash_after_first_install=False, epoch_file=None):
+                 crash_after_first_install=False, epoch_file=None,
+                 undo_enabled=False):
         self.dbpath = dbpath
         # shard_urls: {"db1": url, "db2": url}
         self.shard_urls = shard_urls
         self.fenced = fenced
+        # undo 撤回功能开关：未启用时 POST /undo 返回 404，旧行为完全兼容
+        self.undo_enabled = undo_enabled
         self.crash_after_first_install = crash_after_first_install
         # 本进程代身份文件：每个协调进程必须各自独立（默认按 dbpath 派生）。
         # 多进程共享同一协调库时由调用方经 --epoch-file 显式区分，
@@ -109,8 +127,18 @@ class Coordinator:
             self.conn.execute(
                 "CREATE TABLE IF NOT EXISTS txn ("
                 " txid TEXT PRIMARY KEY, writes BLOB NOT NULL,"
-                " state TEXT NOT NULL, decided_at TEXT)"
+                " state TEXT NOT NULL, decided_at TEXT,"
+                " kind TEXT NOT NULL DEFAULT 'submit',"
+                " target TEXT)"
             )
+            # 旧库平滑升级：补 kind/target 列（历史记录均为普通提交）
+            cols = {r[1] for r in self.conn.execute("PRAGMA table_info(txn)")}
+            if "kind" not in cols:
+                self.conn.execute(
+                    "ALTER TABLE txn ADD COLUMN kind TEXT NOT NULL DEFAULT 'submit'"
+                )
+            if "target" not in cols:
+                self.conn.execute("ALTER TABLE txn ADD COLUMN target TEXT")
             # 跨进程代账：所有协调进程共享本库，代只增不复用。
             # 这是代的唯一权威；进程本地代身份另存独立文件，不放进共享库，
             # 避免共享单行元数据在并发领号时的唯一约束竞争。
@@ -265,13 +293,13 @@ class Coordinator:
         with self.inflight_lock:
             worker = None
             row = self.conn.execute(
-                "SELECT state, writes FROM txn WHERE txid=?", (txid,)
+                "SELECT state, writes, kind FROM txn WHERE txid=?", (txid,)
             ).fetchone()
             if row is not None:
-                # 同 txid 异内容：先于一切锁/协议判断直接拒绝
-                if row[1] != blob:
+                # 同 txid 异内容（含提交/撤回类型不同）：先于一切协议判断拒绝
+                if row[1] != blob or row[2] != "submit":
                     raise Conflict(
-                        "txid %s: 提交内容与首次登记不一致（异内容拒绝）" % txid
+                        "txid %s: 提交内容/类型与首次登记不一致（异内容拒绝）" % txid
                     )
                 state = row[0]
                 worker = self.inflight.get(txid)
@@ -281,7 +309,7 @@ class Coordinator:
                     self._check_leadership()
                     worker = threading.Thread(
                         target=self._recover_one,
-                        args=(txid, norm, PENDING), daemon=True,
+                        args=(txid, norm, PENDING, "submit", None), daemon=True,
                     )
                     self.inflight[txid] = worker
                     worker.start()
@@ -291,7 +319,8 @@ class Coordinator:
                 # 先持久登记事务，再进行任何通信
                 with self.conn:
                     self.conn.execute(
-                        "INSERT INTO txn(txid,writes,state) VALUES(?,?,?)",
+                        "INSERT INTO txn(txid,writes,state,kind,target) "
+                        "VALUES(?,?,?,'submit',NULL)",
                         (txid, blob, PENDING),
                     )
                 t = threading.Thread(
@@ -308,6 +337,134 @@ class Coordinator:
             "SELECT state FROM txn WHERE txid=?", (txid,)
         ).fetchone()[0]
         return final
+
+    # ---------------------------------------------------------- 撤回入口
+    def undo(self, obj, epoch=None):
+        """撤回 target 的已提交普通事务；返回终态 COMMITTED/ABORTED。
+
+        不占号的 409（Conflict，不登记新 txid）：
+          * target 不是两库均完成的普通提交（不存在/PENDING/ABORTED/本身是撤回）；
+          * target 已被成功撤回；
+        占号的情况：资格通过后登记新事务，2PC 中 prepare-undo 冲突则持久
+        ABORTED（同号同内容重放返回原 ABORTED，可换号重试）。
+        """
+        self._ensure_active()
+        txid, target = validate_undo(obj)
+        if txid == target:
+            raise BadRequest("target: 不得与 txid 相同（撤回须使用新事务号）")
+        blob = canonical_undo(txid, target)
+
+        # 第一阶段（锁内）：只做同号记录查询与快速判断，不做可能阻塞的等待
+        with self.inflight_lock:
+            row = self.conn.execute(
+                "SELECT state, writes, kind, target FROM txn WHERE txid=?",
+                (txid,),
+            ).fetchone()
+            existing_worker = self.inflight.get(txid) if row is not None else None
+            need_register = row is None
+
+        if row is not None:
+            # 同号内容（含类型和 target）比对：异内容 409
+            if row[1] != blob or row[2] != "undo":
+                raise Conflict(
+                    "txid %s: 撤回内容/类型与首次登记不一致（异内容拒绝）" % txid
+                )
+            worker = existing_worker
+            state = row[0]
+            if worker is None and state == PENDING:
+                # 接管场景：旧代/旧进程留下的无决定撤回，本代按恢复语义处理
+                self._check_leadership()
+                worker = threading.Thread(
+                    target=self._recover_one,
+                    args=(txid, target, PENDING, "undo", target), daemon=True,
+                )
+                with self.inflight_lock:
+                    # 双检：并发重放可能已登记 worker
+                    if txid not in self.inflight:
+                        self.inflight[txid] = worker
+                        worker.start()
+                    else:
+                        worker = self.inflight[txid]
+        else:
+            # 资格预检在锁外执行（可能等待 target 在途工作线程），
+            # 不通过直接 409 且不占号
+            self._check_undo_eligibility(target)
+            self._check_leadership()
+            with self.inflight_lock:
+                # 双检：并发同号请求可能已完成登记
+                row2 = self.conn.execute(
+                    "SELECT state, writes, kind FROM txn WHERE txid=?", (txid,)
+                ).fetchone()
+                if row2 is not None:
+                    if row2[1] != blob or row2[2] != "undo":
+                        raise Conflict(
+                            "txid %s: 撤回内容/类型与首次登记不一致（异内容拒绝）"
+                            % txid
+                        )
+                    state, worker = row2[0], self.inflight.get(txid)
+                else:
+                    with self.conn:
+                        self.conn.execute(
+                            "INSERT INTO txn(txid,writes,state,kind,target) "
+                            "VALUES(?,?,?,'undo',?)",
+                            (txid, blob, PENDING, target),
+                        )
+                    t = threading.Thread(
+                        target=self._undo_worker, args=(txid, target), daemon=True
+                    )
+                    self.inflight[txid] = t
+                    t.start()
+                    state, worker = PENDING, t
+
+        if worker is not None and worker.is_alive():
+            worker.join()  # 同号同内容重放：等待并返回原结局
+        self._ensure_active()
+        final = self.conn.execute(
+            "SELECT state FROM txn WHERE txid=?", (txid,)
+        ).fetchone()[0]
+        return final
+
+    def _check_undo_eligibility(self, target):
+        """target 资格预检（不占号）：两库均完成的普通提交且未被成功撤回。
+
+        协调库侧只做本地可知的拒绝；两库真实终态/写者以 prepare-undo 为准。
+        """
+        trow = self.conn.execute(
+            "SELECT state, kind, target FROM txn WHERE txid=?", (target,)
+        ).fetchone()
+        if trow is None:
+            raise Conflict("target %s: 未知事务，不能撤回" % target)
+        tstate, tkind, _ = trow
+        if tkind != "submit":
+            raise Conflict("target %s: 撤回事务不能再被撤回" % target)
+        if tstate != COMMITTED:
+            raise Conflict(
+                "target %s: 不是已完成提交（当前状态 %s），不能撤回"
+                % (target, tstate)
+            )
+        # target 若有在途同号提交工作线程，先等其落定，避免误判“未完成”
+        with self.inflight_lock:
+            waiter = self.inflight.get(target)
+        if waiter is not None and waiter.is_alive():
+            waiter.join()
+            trow = self.conn.execute(
+                "SELECT state, kind FROM txn WHERE txid=?", (target,)
+            ).fetchone()
+            if trow is None or trow[1] != "submit" or trow[0] != COMMITTED:
+                raise Conflict(
+                    "target %s: 不是两库均完成的普通提交，不能撤回" % target
+                )
+        # 已有成功撤回：409 且不占号
+        urow = self.conn.execute(
+            "SELECT txid, state FROM txn "
+            "WHERE kind='undo' AND target=? AND state='COMMITTED' LIMIT 1",
+            (target,),
+        ).fetchone()
+        if urow is not None:
+            raise Conflict(
+                "target %s: 已被事务 %s 成功撤回，不能重复撤回"
+                % (target, urow[0])
+            )
 
     # ---------------------------------------------------------- 2PC 工作流
     def _worker(self, txid, norm):
@@ -343,12 +500,23 @@ class Coordinator:
     def _prepare_until_answer(self, txid, norm, shard):
         """向一个分库反复 prepare，直到拿到明确投票；重复投递天然幂等。"""
         body = {"txid": txid, "writes": norm}
+        return self._prepare_phase_until_answer(txid, shard, body, "/prepare")
+
+    def _prepare_undo_until_answer(self, txid, target, shard):
+        """向一个分库反复 prepare-undo，直到拿到明确投票。"""
+        body = {"txid": txid, "target": target}
+        return self._prepare_phase_until_answer(
+            txid, shard, body, "/prepare-undo"
+        )
+
+    def _prepare_phase_until_answer(self, txid, shard, body, path):
+        """prepare / prepare-undo 共用的重试循环。"""
         i = 0
         while True:
             self._ensure_active()
             try:
                 code, data = post_json(
-                    self.shard_urls[shard], "/prepare", body,
+                    self.shard_urls[shard], path, body,
                     epoch=self.epoch,
                 )
             except OSError:
@@ -357,23 +525,57 @@ class Coordinator:
             if code == 409 and isinstance(data, dict) \
                     and data.get("reason") == "stale_epoch":
                 self._mark_fenced_out(
-                    "prepare 被分库 %s 判 stale（%r）"
-                    % (shard, data.get("installed_epoch"))
+                    "%s 被分库 %s 判 stale（%r）"
+                    % (path, shard, data.get("installed_epoch"))
                 )
-                raise FencedOut("prepare 时代不符")
+                raise FencedOut("准备阶段时代不符")
             if isinstance(data, dict) and data.get("vote") in (
                 "PREPARED",
                 "ABORTED",
                 "COMMITTED",
             ):
                 return data["vote"]
-            # 409 且无 vote（如同 txid 异内容）是分库的永久性拒绝，
+            # 409 且无 vote（如异内容）是分库的永久性拒绝，
             # 不可能靠重试恢复，按反对票处理以推动协调者作出 ABORT 决定。
             if code == 409:
                 return "ABORTED"
             # 断连/超时/5xx 等：恢复后最终可达，继续重试
             time.sleep(RETRY_DELAYS[min(i, len(RETRY_DELAYS) - 1)])
             i += 1
+
+    # ------------------------------------------------------- 撤回 2PC 工作流
+    def _undo_worker(self, txid, target):
+        try:
+            votes = {}
+            for shard in SHARDS:
+                votes[shard] = self._prepare_undo_until_answer(
+                    txid, target, shard
+                )
+                # 复用故障注入点：单库撤回准备后强退（决定尚未落盘）
+                if self.crash_after_first_prepare:
+                    self.crash_after_first_prepare = False
+                    sys.stderr.write(
+                        "[fault] crash after first prepare-undo (txid=%s)\n" % txid
+                    )
+                    os._exit(77)
+
+            if all(v == "PREPARED" for v in votes.values()):
+                decision = COMMITTED
+            else:
+                decision = ABORTED
+            self._persist_decision(txid, decision)
+
+            if decision == COMMITTED:
+                self._commit_both(txid)
+            else:
+                self._abort_both(txid)
+        except FencedOut:
+            sys.stderr.write(
+                "[fence] undo-worker(txid=%s) 因代失效中止\n" % txid
+            )
+        finally:
+            with self.inflight_lock:
+                self.inflight.pop(txid, None)
 
     def _persist_decision(self, txid, decision):
         # 只有当前代能持久决定：再核对一次共享代账
@@ -446,16 +648,27 @@ class Coordinator:
         """启动时同步恢复：无决定事务撤销；已有 commit 继续完成。
 
         fenced 模式下必须在两库安装本代之后调用；恢复全部完成才对外服务。
+        普通提交与撤回事务按 kind 区分，各自沿用原 txid 与内容恢复。
         """
-        rows = self.conn.execute("SELECT txid, writes, state FROM txn").fetchall()
-        for txid, blob, state in rows:
+        rows = self.conn.execute(
+            "SELECT txid, writes, state, kind, target FROM txn"
+        ).fetchall()
+        for txid, blob, state, kind, target in rows:
             if isinstance(blob, str):  # 兼容被外部以 TEXT 写入的记录
                 blob = blob.encode("utf-8")
-            norm = json.loads(blob.decode("utf-8"))
-            # 恢复期间重新登记 inflight，供 /status 观测
-            t = threading.Thread(
-                target=self._recover_one, args=(txid, norm, state), daemon=True
-            )
+            parsed = json.loads(blob.decode("utf-8"))
+            if kind == "undo":
+                # 撤回内容字节串内含 target；优先用列值，兜底从 blob 解析
+                tgt = target or parsed.get("target")
+                t = threading.Thread(
+                    target=self._recover_one,
+                    args=(txid, tgt, state, "undo", tgt), daemon=True,
+                )
+            else:
+                t = threading.Thread(
+                    target=self._recover_one,
+                    args=(txid, parsed, state, "submit", None), daemon=True,
+                )
             with self.inflight_lock:
                 self.inflight[txid] = t
             t.start()
@@ -463,24 +676,28 @@ class Coordinator:
         for t in list(self.inflight.values()):
             t.join()
 
-    def _recover_one(self, txid, norm, state):
+    def _recover_one(self, txid, payload, state, kind, target):
         try:
             if state == PENDING:
                 # 无决定的事务撤销（即使某分库已 prepare，abort 亦安全）
                 self._persist_decision(txid, ABORTED)
                 self._abort_both(txid)
             elif state == COMMITTED:
-                # 决定不可推翻：继续把 commit 通知补发完成
+                # 决定不可推翻：继续把 commit 通知补发完成（分库幂等，
+                # 撤回提交依准备镜像只应用一次）
                 self._commit_both(txid)
             else:  # ABORTED：补发 abort 直到双方确认
                 self._abort_both(txid)
         except FencedOut:
             sys.stderr.write(
-                "[fence] recover(txid=%s) 因代失效中止，等待更新代处理\n" % txid
+                "[fence] recover(txid=%s,kind=%s) 因代失效中止，等待更新代处理\n"
+                % (txid, kind)
             )
         except Conflict:
             # 决定已被接管方落盘：本代不再插手该事务
-            sys.stderr.write("[fence] recover(txid=%s) 决定已存在，退出\n" % txid)
+            sys.stderr.write(
+                "[fence] recover(txid=%s) 决定已存在，退出\n" % txid
+            )
         finally:
             with self.inflight_lock:
                 self.inflight.pop(txid, None)
@@ -493,6 +710,12 @@ class Coordinator:
         if row is None:
             return None
         return row[0]
+
+    def status_row(self, txid):
+        """返回 (state, kind, target)；未知 txid 返回 None。"""
+        return self.conn.execute(
+            "SELECT state, kind, target FROM txn WHERE txid=?", (txid,)
+        ).fetchone()
 
     def consistent_data(self, epoch=None):
         """双库一致查询。
@@ -603,6 +826,7 @@ def make_handler(coord):
                         "coordinator": True, "ok": True,
                         "fenced": coord.fenced, "epoch": coord.epoch,
                         "fenced_out": coord.fenced_out,
+                        "undo_enabled": coord.undo_enabled,
                     })
                 elif path == "/debug/epoch":
                     # 观测接口不设代号守卫，便于测试确认代际状态
@@ -619,11 +843,13 @@ def make_handler(coord):
                     epoch = self._query_epoch()
                     self._guard_epoch(epoch)
                     txid = path[len("/txn/"):-len("/status")]
-                    st = coord.status(txid)
-                    if st is None:
+                    row = coord.status_row(txid)
+                    if row is None:
                         self._send(404, {"error": "未知 txid", "txid": txid})
                     else:
-                        self._send(200, {"txid": txid, "state": st})
+                        state, kind, target = row
+                        self._send(200, {"txid": txid, "state": state,
+                                         "kind": kind, "target": target})
                 else:
                     self._send(404, {"error": "未知路径", "path": self.path})
             except BadRequest as e:
@@ -650,6 +876,24 @@ def make_handler(coord):
                     state = coord.submit(obj, epoch=epoch)
                     self._send(200, {
                         "txid": validate_transaction(obj)[0],
+                        "kind": "submit",
+                        "state": state,
+                        "result": "committed" if state == COMMITTED else "aborted",
+                    })
+                elif path == "/undo":
+                    if not coord.undo_enabled:
+                        # 未启用撤回：兼容旧协议，按未知路径处理，不建事务
+                        self._send(404, {"error": "未知路径", "path": self.path})
+                        return
+                    # 同样先类型校验、再判代号，最后做撤回内容校验
+                    epoch = self._request_epoch(obj)
+                    self._guard_epoch(epoch)
+                    txid, target = validate_undo(obj)
+                    state = coord.undo(obj, epoch=epoch)
+                    # 撤回成功 200；2PC 冲突整批 ABORTED 映射为 409
+                    code = 200 if state == COMMITTED else 409
+                    self._send(code, {
+                        "txid": txid, "target": target, "kind": "undo",
                         "state": state,
                         "result": "committed" if state == COMMITTED else "aborted",
                     })
@@ -691,6 +935,8 @@ def main():
     ap.add_argument("--db2-url", required=True)
     ap.add_argument("--fenced", action="store_true",
                     help="启用 fenced 代模式：领号、安装分库、代校验")
+    ap.add_argument("--undo", action="store_true",
+                    help="启用撤回模式：接受 POST /undo（可与 --fenced 并用）")
     ap.add_argument("--epoch-file", default=None,
                     help="本进程代身份文件；多个协调进程共享协调库时必须各自不同")
     ap.add_argument("--crash-after-first-install", action="store_true",
@@ -706,6 +952,7 @@ def main():
         fenced=args.fenced,
         crash_after_first_install=args.crash_after_first_install,
         epoch_file=args.epoch_file,
+        undo_enabled=args.undo,
     )
 
     if args.fenced:
@@ -723,8 +970,8 @@ def main():
     print("coordinator recovery done", flush=True)
 
     httpd = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(coord))
-    print("coordinator listening on %d, db=%s, fenced=%s, epoch=%s"
-          % (args.port, args.db, args.fenced, coord.epoch), flush=True)
+    print("coordinator listening on %d, db=%s, fenced=%s, epoch=%s, undo=%s"
+          % (args.port, args.db, args.fenced, coord.epoch, args.undo), flush=True)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

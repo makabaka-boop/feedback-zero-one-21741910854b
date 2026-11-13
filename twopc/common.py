@@ -117,6 +117,48 @@ def validate_transaction(obj):
     return txid, norm
 
 
+def _check_ident(value, field):
+    """标识符字段校验：非空 ASCII 字母数字串；错误定位到 field。"""
+    if not isinstance(value, str):
+        raise BadRequest("%s: 必须是字符串" % field)
+    if not value:
+        raise BadRequest("%s: 不得为空字符串" % field)
+    if not _IDENT_RE.match(value):
+        raise BadRequest("%s: 必须是非空 ASCII 字母数字串" % field)
+    return value
+
+
+def validate_undo(obj):
+    """校验撤回 JSON：{"txid": 标识符, "target": 标识符}。
+
+    标识规则与 /submit 沿用同一套；非法输入抛 BadRequest 并定位到
+    txid / target 字段路径，不建任何事务。
+    """
+    if not isinstance(obj, dict):
+        raise BadRequest("body 必须是 JSON 对象")
+    if "txid" not in obj:
+        raise BadRequest("txid: 字段缺失")
+    txid = _check_ident(obj["txid"], "txid")
+    if "target" not in obj:
+        raise BadRequest("target: 字段缺失")
+    target = _check_ident(obj["target"], "target")
+    return txid, target
+
+
+def canonical_undo(txid, target):
+    """规范化撤回请求为稳定字节串，用于同号内容比对（含类型与 target）。
+
+    顶层键 kind/txid/target 与提交写集（db1/db2）天然不同，因此同一 txid
+    跨类型（提交 vs 撤回）重放必判异内容 409。
+    """
+    return json.dumps(
+        {"kind": "undo", "txid": txid, "target": target},
+        separators=(",", ":"),
+        ensure_ascii=False,
+        sort_keys=True,
+    ).encode("utf-8")
+
+
 def canonical_writes(norm):
     """规范化写集为稳定字节串，用于同 txid 内容比对（按 key 排序）。"""
     return json.dumps(

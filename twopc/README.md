@@ -8,12 +8,13 @@
 
 | 文件 | 作用 |
 |---|---|
-| `common.py` | 输入校验（txid/key 标识规则、写集规范化、epoch 正整数校验）、HTTP 客户端工具（可携带 epoch） |
-| `shard.py` | 分库（参与者）进程：prepare/commit/abort、键锁、持久终态、故障注入、代安装与代号守卫 |
-| `coordinator.py` | 协调者进程：事务登记、2PC 驱动、持久决定、重启恢复、一致查询、fenced 代（epoch）领号与接管 |
+| `common.py` | 输入校验（txid/key 标识规则、写集规范化、撤回 `{txid,target}` 校验与规范化、epoch 正整数校验）、HTTP 客户端工具（可携带 epoch） |
+| `shard.py` | 分库（参与者）进程：prepare/commit/abort、键锁、持久终态、故障注入、代安装与代号守卫、撤回准备/写者/镜像 |
+| `coordinator.py` | 协调者进程：事务登记、2PC 驱动、持久决定、重启恢复、一致查询、fenced 代（epoch）领号与接管、`POST /undo` 撤回 |
 | `acceptance_test.py` | 三进程端到端验收（含两类强退与三类通信故障） |
 | `fence_acceptance_test.py` | fenced 代模式验收：双协调进程滚动接管、强退、迟到代消息、线性一致（99 项断言） |
-| `run_demo.sh` | 手动启动三进程演示（`./run_demo.sh` 普通模式 / `./run_demo.sh fenced` 代模式） |
+| `undo_acceptance_test.py` | 撤回模式验收：题面示例、镜像恢复/写者规则、空批竞争、丢应答、单库撤回后强退接管（135 项断言） |
+| `run_demo.sh` | 手动启动三进程演示（`normal` / `fenced` / `undo` / `fenced-undo` 四种模式） |
 
 运行要求：Python 3.8+，无第三方依赖。所有命令建议用 `python3 -I` 运行。
 
@@ -23,10 +24,13 @@
 # 一键验收（自动拉起/强退/重启三个进程，结束自动清理）
 python3 -I acceptance_test.py        # 普通模式，88 项断言
 python3 -I fence_acceptance_test.py  # fenced 代模式，99 项断言
+python3 -I undo_acceptance_test.py   # 撤回模式（含强退接管），135 项断言
 
 # 手动演示
-./run_demo.sh            # 普通模式
-./run_demo.sh fenced     # fenced 代模式
+./run_demo.sh                # 普通模式
+./run_demo.sh fenced         # fenced 代模式
+./run_demo.sh undo           # 撤回模式
+./run_demo.sh fenced-undo    # 代 + 撤回并用
 ```
 
 ## 事务 JSON 格式
@@ -47,6 +51,15 @@ python3 -I fence_acceptance_test.py  # fenced 代模式，99 项断言
   （与键不存在相区别）。初始两库均为空。
 * 非法输入返回 `400` 且错误信息定位到具体字段（如 `writes.db1.k: ...`），**不建事务**。
 
+撤回请求（需 `--undo`）格式：
+
+```json
+{ "txid": "undo001", "target": "tx001" }
+```
+
+* `target` 必须是两库均已完成的普通提交；撤回是新事务，与提交共用 txid 号空间；
+  非法字段同样 `400` 定位到 `txid` / `target`，资格类拒绝 `409` 且不占号。
+
 ## HTTP 接口
 
 ### 协调者（默认 19010）
@@ -54,25 +67,28 @@ python3 -I fence_acceptance_test.py  # fenced 代模式，99 项断言
 | 方法/路径 | 说明 |
 |---|---|
 | `POST /submit` | 提交事务；同步返回 `{"state":"COMMITTED|ABORTED"}`，仅双方确认 commit 后才 committed |
-| `GET /txn/{txid}/status` | 协调者侧事务状态 `PENDING/COMMITTED/ABORTED` |
+| `POST /undo` | 撤回模式（`--undo`）：`{"txid","target"}`；成功 200，2PC 冲突整批 ABORTED 映射 409；未启用返回 404 |
+| `GET /txn/{txid}/status` | 协调者侧事务状态 `PENDING/COMMITTED/ABORTED`，附 `kind`（submit/undo）与 `target` |
 | `GET /data` | **双库一致查询**：等待在途事务结束，并在提交互斥锁内读取两库，按 key 字节序返回 |
 | `GET /debug/epoch` | 观测：`fenced`、本进程 `epoch`、代账最大值 `ledger_max`、是否 `fenced_out`（无代号守卫） |
-| `POST /control/crash-after-first-prepare` | 故障注入：下一个事务在单库 prepare 后 `SIGKILL` 式强退 |
-| `POST /control/crash-after-first-commit` | 故障注入：下一个事务 commit 落盘且仅一库应用后强退 |
+| `POST /control/crash-after-first-prepare` | 故障注入：下一个事务（含撤回）在单库 prepare 后 `SIGKILL` 式强退 |
+| `POST /control/crash-after-first-commit` | 故障注入：下一个事务（含撤回）commit 落盘且仅一库应用后强退 |
 
 ### 分库（默认 19011/19012）
 
 | 方法/路径 | 说明 |
 |---|---|
 | `POST /install` | fenced 专用：安装代 `{"epoch":N}`；同代幂等、低代 409 拒绝、高代原子提升；不动准备/锁/终态 |
-| `POST /prepare` | 持久写集并独占键锁；锁冲突立即投反对票（不等待）；不改可见数据 |
-| `POST /commit` | 仅 PREPARED 可提交；原子应用写集、释放锁；重复调用幂等 |
-| `POST /abort` | 丢弃准备并释放锁；**先于 prepare 到达也持久记 ABORTED** |
+| `POST /prepare` | 持久写集并独占键锁；锁冲突立即投反对票（不等待）；不改可见数据；同时持久每键写入前镜像 |
+| `POST /prepare-undo` | 撤回模式：持 target 原写键锁并核对全部最后写者仍为 target；不符/冲突整批反对；未启用 404 |
+| `POST /commit` | 仅 PREPARED 可提交；普通提交应用写集（保留镜像），撤回提交按 target 镜像恢复/删除；幂等 |
+| `POST /abort` | 丢弃准备并释放锁；**先于 prepare 到达也持久记 ABORTED**；撤回 abort 释放 target 注册可换号重试 |
 | `GET /txn/{txid}/status` | 分库侧状态 `PREPARED/COMMITTED/ABORTED` |
 | `GET /data` | 仅已提交数据，按 key 字节序（fenced 下须带代） |
 | `GET /debug/epoch` | 观测：分库是否 fenced 与已安装代（无代号守卫） |
 | `GET /debug/locks`、`/debug/stats` | 持锁视图、应用计数（验收幂等用） |
-| `POST /control/drop-next` | `{"phase":"prepare|commit|abort"}`：下一次该接口落盘后丢弃应答 |
+| `GET /debug/writers`、`/debug/undo` | 最后写者视图（撤回删除也留痕）、撤回 target 注册表 |
+| `POST /control/drop-next` | `{"phase":"prepare|prepare-undo|commit|abort"}`：下一次该接口落盘后丢弃应答 |
 | `POST /control/delay-next` | `{"phase":...,"seconds":N}`：下一次该接口落盘后延迟应答（制造接管竞态） |
 
 ## 协议与正确性要点
@@ -81,7 +97,8 @@ python3 -I fence_acceptance_test.py  # fenced 代模式，99 项断言
    之后才发起 prepare。
 2. **交错 prepare + 键锁**：分库把写集和 `(txid,key)` 锁持久化；任一键已被其他
    事务持有就立即返回反对（本库同时持久 ABORTED），不阻塞等待。PREPARED 期间
-   数据对外不可见。
+   数据对外不可见。普通 prepare 同时把每个写键的**写入前存在性与原值**快照到
+   `prep_image`，提交后保留，供撤回按 target 写入前状态恢复/删除。
 3. **内容固定**：同 txid 的写集以首次内容为准（规范化 JSON 落盘），异内容一律
    `409` 拒绝，且**内容判断先于锁冲突判断**；协调者侧重提异内容同样直接拒绝。
 4. **决定持久且不可逆**：全赞成才落盘 COMMIT，任一反对落盘 ABORT；未收齐应答
@@ -153,6 +170,87 @@ python3 -I fence_acceptance_test.py  # fenced 代模式，99 项断言
 持锁）。第 2 代接管：领到更高代并安装两库 → 恢复时沿用原 txid 与内容，把
 commit 补发给 db2，最终**两库 k 均为 "a"**，db1 不重复应用；此后迟到的
 第 1 代 `abort` 携带旧代号，被两库以 `409 stale_epoch` 拒绝，终态与数据不变。
+
+## undo 撤回模式（`--undo`，可与 `--fenced` 并用）
+
+实验平台需要安全撤回误发布批次。三个进程均加 `--undo` 启用（协调者与分库
+必须同时启用；未启用时 `POST /undo` 与分库 `/prepare-undo` 返回 404，旧协议
+字节与行为完全不变）。撤回本身是一个**新事务**，走与普通提交完全相同的 2PC
+驱动、持久决定与重启恢复机制。
+
+### 请求与号空间
+
+* `POST /undo` 接收 `{"txid":"U","target":"T"}`，`txid` 与 `target` 沿用同一
+  套非空 ASCII 字母数字标识规则；`txid` 不得等于 `target`。
+* 撤回与 `/submit` **共用 txid 号空间**：同一 txid 先判代号守卫（fenced），
+  再判同号内容——内容规范化字节串内含 `kind`（submit/undo）与 `target`，
+  因此跨类型重放、同号异 target 一律 `409`；同号同内容重放返回**原结局**。
+* **不占号的 409**（协调库与分库都不留新 txid 痕迹）：
+  * target 不是**两库均已完成的普通提交**（未知、PENDING、ABORTED、本身是撤回）；
+  * target 已被成功撤回（同 target 至多一次成功）。
+* 占号的情况：资格通过后登记新事务；若 2PC 中分库撤回准备冲突，整批持久
+  `ABORTED`（HTTP 映射 409），**失败可换号重试**。
+* 非法字段返回 `400` 并定位到 `txid` / `target` 字段路径，不建事务。
+
+### 分库持久结构与语义
+
+| 表 | 作用 |
+|---|---|
+| `prep_image(txid,k,existed,v)` | 普通 prepare 时为每个写键保存**该事务写入前**的原存在性与原值；普通 commit 后**保留**（撤回的权威恢复依据），普通 abort 清理 |
+| `writers(k,writer)` | 每键最后写者 txid；每次提交（**含同值覆盖**）都更新；撤回删除/恢复也留写者为撤回号，**不恢复旧来源** |
+| `undo_target(target,undo_txid)` | 同 target 在本库至多注册一个成功准备；撤回 abort 时删除注册行以允许换号重试 |
+
+撤回准备（`/prepare-undo`）在单个 SQLite 写事务内依次核对：
+
+1. 同 txid 已有记录：内容（含类型/target）比对、终态不可逆、幂等返回；
+2. target 必须是本库 `COMMITTED` 的普通事务，且其写入前镜像完整；
+3. `undo_target` 注册表无该 target 的其他撤回号；
+4. target 的写键当前无其他在途事务持锁（冲突立即反对，不等待）；
+5. target 写键的**最后写者仍全部是 target**——中间任何批次（即使写**相同值**）
+   覆盖过都会导致整批 `ABORTED`；
+6. 全部通过才持久撤回登记、注册 target、持原写键锁。空写集 target 无键可
+   核对，仅走 target 终态与注册表守卫，**空写集可撤回**。
+
+撤回提交按 **target 的写入前镜像**应用：原存在则恢复原值（旧值为 SQL NULL
+时恢复成 `null`——null 仍是值，与键不存在相区别），原不存在则删除当前键；
+撤回 txn 自身终态为 `COMMITTED`，而 **target 终态保持 `COMMITTED` 不变**。
+
+### 题面示例（`undo_acceptance_test.py` U1/U5）
+
+* 空库 T 向两库写 `k=null`（T 写入前 k 不存在）。`{txid:"U",target:"T"}`
+  撤回成功后，两库均无键 `k`，但 `writers` 中 `k → U` 留痕；T 与 U 的终态
+  都是 `COMMITTED`。
+* 若 T 之后另有批次 M 对 `k` 做**同值覆盖**，`writers(k)` 变为 M，此时撤回
+  T 在两库的撤回准备均判写者不符 → 整批 `ABORTED`；换号重试结果不变，
+  只能撤回 M（撤回 M 恢复的是 M 准备期镜像，而非更早的旧来源）。
+
+### 故障与重启接管
+
+* 撤回复用全部既有故障语义：`prepare-undo`/`commit` 丢应答靠持久状态 +
+  幂等重试收敛，`undo_commit_applied` 计数证明只应用一次；
+* 单库撤回准备后协调者强退（无决定）→ 重启补 ABORT，分库释放锁与 target
+  注册，数据不变，随后可换号重新撤回；
+* 撤回 commit 落盘仅一库应用后强退（有决定）→ 重启向两库补发 commit，
+  已应用库幂等跳过，镜像与写者保证不重复应用，最终两库值/终态/锁一致；
+* 允许交错准备多个撤回号，注册表与键锁保证同 target 至多一次成功，
+  失败者整批 `ABORTED` 且可换号重试。
+
+### 撤回验收场景（`undo_acceptance_test.py`，135 项断言）
+
+| 编号 | 覆盖点 |
+|---|---|
+| U1 | 题面示例：空库写 null 后撤回两库无 k；原终态不变；删除留写者；注册表/锁核对 |
+| U2 | 镜像恢复旧值/删除原不存在键；同值覆盖更新写者；写者不恢复旧来源；null 还原 |
+| U3 | 空写集可撤回；同 target 至多一次成功；重复撤回 409 不占号；同号重放原结局 |
+| U4 | 空批竞争与非空 target 并发撤回：一成一败、败者换号重试、注册表只记 winner |
+| U5 | 中间同值覆盖后撤回 target 必须 ABORTED；撤回覆盖事务恢复其准备期镜像 |
+| U6 | prepare-undo/commit 丢应答重试收敛，`undo_commit_applied` 只应用一次 |
+| U7 | 单库撤回准备后强退：重启撤销、锁/注册释放、同号原结局、换号再撤回成功 |
+| U8 | 单库撤回提交后强退：重启补齐双库、不重复应用、值/终态/锁一致、无关键不动 |
+| U9 | 资格预检 409 不占号；跨类型/异 target 同号 409；撤回事务不能再被撤回 |
+| U10 | 未启用 `--undo` 三进程兼容（404 不留痕）；11 类非法字段 400 定位 |
+
+共 135 项断言，可重复运行（每轮清空 `run_undo/` 重建进程与库）。
 
 ### fenced 验收场景（`fence_acceptance_test.py`，99 项断言）
 
